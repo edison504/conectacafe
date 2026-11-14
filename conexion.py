@@ -1,4 +1,3 @@
-"""Capa de conexión: abre la conexión con la base de datos MySQL de Café Conecta."""
 import mysql.connector
 
 from config import BASE_DATOS

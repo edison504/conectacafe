@@ -1,18 +1,10 @@
-"""
-Configuración de Café Conecta.
-
-Aquí van los datos de conexión a la base de datos y la cuenta de correo
-que envía la recuperación de usuario y contraseña. Edite estos valores
-antes de ejecutar el programa.
-"""
-
 BASE_DATOS = {
-    "host": "localhost",
-    "port": 3307,
-    "user": "root",
-    "password": "",
-    "database": "cafeconecta",
-}
+       "host": "127.0.0.1",
+       "port": 8889,
+       "user": "root",
+       "password": "root",
+       "database": "cafeconecta",
+   }
 
 CORREO = {
     "servidor": "smtp.gmail.com",

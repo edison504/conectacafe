@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Café Conecta",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/presentacion.py",
+            "cwd": "${workspaceFolder}",
+            "python": "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+            "console": "integratedTerminal"
+        }
+    ]
+}

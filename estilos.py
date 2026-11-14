@@ -1,4 +1,3 @@
-"""Colores, fuentes y dibujos (temática cafetera) compartidos por todas las ventanas."""
 import math
 import tkinter as tk
 from tkinter import ttk

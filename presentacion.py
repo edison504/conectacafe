@@ -1,17 +1,26 @@
-"""
-Capa de presentación de Café Conecta.
-
-Ejecutar:  python presentacion.py
-
-Pantallas: Acceso al sistema, Recuperación de credenciales y Panel principal
-(con el menú de Gestión Perfil, Gestión Usuario y Gestión Persona).
-"""
 import tkinter as tk
 from tkinter import messagebox
 
 import estilos as e
 import formularios
 from negocio import LogicaAcceso, PERMISOS, permisos_de
+
+
+# Módulos del panel principal: (entidad, ícono, título, descripción)
+MODULOS = [
+    ("Gestión cafetera", [
+        ("Productor", "☘", "Productores", "Caficultores: datos de contacto, cooperativas y fincas."),
+        ("Finca", "⛰", "Fincas", "Dónde se produce el café: área, clima y ubicación."),
+        ("Cooperativa", "⌂", "Cooperativas", "Organizaciones que compran el café."),
+        ("Asociacion", "⇄", "Asociaciones", "Afiliación de productores a cooperativas."),
+        ("Variedad", "❦", "Variedades", "Castillo, Caturra, Geisha… con su imagen."),
+    ]),
+    ("Administración del sistema", [
+        ("Persona", "☺", "Personas", "Datos personales de quienes usan el sistema."),
+        ("Usuario", "⚿", "Usuarios", "Cuentas de acceso, perfiles y compradores."),
+        ("Perfil", "⚙", "Perfiles", "Tipos de usuario y sus permisos."),
+    ]),
+]
 
 
 class Aplicacion(tk.Tk):
@@ -126,15 +135,18 @@ class Aplicacion(tk.Tk):
         permisos = permisos_de(sesion["perfil"])
         self.title("Café Conecta - Panel Principal")
         self.resizable(True, True)
-        e.centrar(self, 1120, 720)
-        self.minsize(980, 660)
+        e.centrar(self, 1180, 780)
+        self.minsize(1040, 720)
 
         # Menú superior
         barra_menu = tk.Menu(self)
         menu_gestion = tk.Menu(barra_menu, tearoff=0)
-        for nombre in ("Perfil", "Usuario", "Persona"):
-            menu_gestion.add_command(label=f"Gestión {nombre}", command=lambda n=nombre: self.abrir_gestion(n),
-                                     state="normal" if nombre in permisos else "disabled")
+        for grupo, modulos_grupo in MODULOS:
+            if grupo != MODULOS[0][0]:
+                menu_gestion.add_separator()
+            for entidad, _icono, titulo, _texto in modulos_grupo:
+                menu_gestion.add_command(label=f"Gestión {titulo}", command=lambda n=entidad: self.abrir_gestion(n),
+                                         state="normal" if entidad in permisos else "disabled")
         barra_menu.add_cascade(label="Gestión", menu=menu_gestion)
         menu_sesion = tk.Menu(barra_menu, tearoff=0)
         menu_sesion.add_command(label="Cerrar sesión", command=self.cerrar_sesion)
@@ -153,61 +165,46 @@ class Aplicacion(tk.Tk):
                  bg=e.CAFE_OSCURO, fg=e.DORADO).pack(side="right", padx=10)
 
         # Banner con paisaje cafetero
-        banner = tk.Canvas(self, height=210, highlightthickness=0, bg=e.CREMA)
+        banner = tk.Canvas(self, height=150, highlightthickness=0, bg=e.CREMA)
         banner.pack(fill="x")
+        subtitulo = {"Productor": "Mis datos, mis fincas y las variedades de café",
+                     "Comprador": f"Comprador de {sesion.get('cooperativa') or 'su cooperativa'}"}.get(
+            sesion["perfil"], "Panel de gestión cafetera · Sector agropecuario")
 
         def dibujar_banner(_evento=None):
             ancho = max(banner.winfo_width(), 900)
-            e.paisaje_cafetero(banner, ancho, 210, con_taza=False, nivel=0.28)
-            e.rama_cafeto(banner, ancho - 10, 205, 0.9, invertir=True)
-            e.taza(banner, ancho * 0.56, 100, 0.75)
-            banner.create_text(32, 50, anchor="w", text=f"¡Bienvenido(a), {sesion['nombre'].split()[0]}!",
+            e.paisaje_cafetero(banner, ancho, 150, con_taza=False, nivel=0.30)
+            e.rama_cafeto(banner, ancho - 10, 148, 0.75, invertir=True)
+            e.taza(banner, ancho * 0.58, 72, 0.6)
+            banner.create_text(32, 38, anchor="w", text=f"¡Bienvenido(a), {sesion['nombre'].split()[0]}!",
                                font=(e.FUENTE, 24, "bold"), fill=e.CAFE_OSCURO)
-            banner.create_text(34, 86, anchor="w", font=(e.FUENTE, 12),
-                               fill=e.CAFE_OSCURO,
-                               text="Panel de gestión cafetera · Sector agropecuario")
-            banner.create_text(34, 110, anchor="w", font=(e.FUENTE, 10, "italic"), fill=e.CAFE,
+            banner.create_text(34, 70, anchor="w", font=(e.FUENTE, 12), fill=e.CAFE_OSCURO, text=subtitulo)
+            banner.create_text(34, 92, anchor="w", font=(e.FUENTE, 10, "italic"), fill=e.CAFE,
                                text="Seleccione un módulo en las tarjetas de abajo o en el menú Gestión.")
         banner.bind("<Configure>", dibujar_banner)
 
         cuerpo = tk.Frame(self, bg=e.CREMA)
-        cuerpo.pack(fill="both", expand=True, padx=24, pady=16)
+        cuerpo.pack(fill="both", expand=True, padx=24, pady=12)
 
         # Tarjetas de estadísticas
         self.frame_stats = tk.Frame(cuerpo, bg=e.CREMA)
         self.frame_stats.pack(fill="x")
         self.actualizar_estadisticas()
 
-        # Tarjetas de módulos
-        tk.Label(cuerpo, text="Módulos de gestión", font=e.F_SUBTITULO, bg=e.CREMA,
-                 fg=e.CAFE_OSCURO).pack(anchor="w", pady=(18, 8))
-        modulos = tk.Frame(cuerpo, bg=e.CREMA)
-        modulos.pack(fill="x")
-        datos_modulos = [
-            ("Perfil", "⚙", "Gestión Perfil", "Tipos de usuario: administrador,\ncaficultor, catador, cliente…"),
-            ("Persona", "☘", "Gestión Persona", "Caficultores, recolectores,\nempleados y clientes."),
-            ("Usuario", "☺", "Gestión Usuario", "Cuentas de acceso al sistema\npara cada persona registrada."),
-        ]
-        for columna, (entidad, icono, titulo, texto) in enumerate(datos_modulos):
-            permitido = entidad in permisos
-            tarjeta = tk.Frame(modulos, bg=e.BLANCO, highlightbackground=e.CREMA_OSCURO, highlightthickness=1)
-            tarjeta.grid(row=0, column=columna, sticky="nsew", padx=(0 if columna == 0 else 12, 0))
-            modulos.columnconfigure(columna, weight=1)
-            tk.Label(tarjeta, text=icono, font=(e.FUENTE, 26), bg=e.BLANCO,
-                     fg=e.VERDE if permitido else e.GRIS).pack(anchor="w", padx=16, pady=(12, 0))
-            tk.Label(tarjeta, text=titulo, font=e.F_SUBTITULO, bg=e.BLANCO, fg=e.CAFE_OSCURO).pack(
-                anchor="w", padx=16)
-            tk.Label(tarjeta, text=texto, font=e.F_PEQUENA, bg=e.BLANCO, fg=e.GRIS, justify="left").pack(
-                anchor="w", padx=16, pady=(2, 10))
-            b = e.boton(tarjeta, "Abrir" if permitido else "Sin permiso",
-                        lambda n=entidad: self.abrir_gestion(n), e.VERDE if permitido else e.GRIS)
-            b.pack(anchor="w", padx=16, pady=(0, 14))
-            if not permitido:
-                e.deshabilitar(b)
+        # Tarjetas de módulos, en dos grupos
+        for grupo, modulos_grupo in MODULOS:
+            tk.Label(cuerpo, text=grupo, font=e.F_SUBTITULO, bg=e.CREMA,
+                     fg=e.CAFE_OSCURO).pack(anchor="w", pady=(10, 4))
+            fila_tarjetas = tk.Frame(cuerpo, bg=e.CREMA)
+            fila_tarjetas.pack(fill="x")
+            for columna in range(5):
+                fila_tarjetas.columnconfigure(columna, weight=1, uniform="tarjetas")
+            for columna, (entidad, icono, titulo, texto) in enumerate(modulos_grupo):
+                self._tarjeta_modulo(fila_tarjetas, columna, entidad, icono, titulo, texto, entidad in permisos)
 
         # Ciclo del café (franja informativa)
-        ciclo = tk.Canvas(cuerpo, height=66, bg=e.CREMA, highlightthickness=0)
-        ciclo.pack(fill="x", pady=(18, 0))
+        ciclo = tk.Canvas(cuerpo, height=62, bg=e.CREMA, highlightthickness=0)
+        ciclo.pack(fill="x", pady=(8, 0))
 
         def dibujar_ciclo(_evento=None):
             ciclo.delete("all")
@@ -223,6 +220,22 @@ class Aplicacion(tk.Tk):
                 ciclo.create_text(x, 54, text=nombre, fill=e.CAFE_OSCURO, font=e.F_PEQUENA)
         ciclo.bind("<Configure>", dibujar_ciclo)
 
+    def _tarjeta_modulo(self, contenedor, columna, entidad, icono, titulo, texto, permitido):
+        tarjeta = tk.Frame(contenedor, bg=e.BLANCO, highlightbackground=e.CREMA_OSCURO, highlightthickness=1)
+        tarjeta.grid(row=0, column=columna, sticky="nsew", padx=(0 if columna == 0 else 10, 0))
+        cabeza = tk.Frame(tarjeta, bg=e.BLANCO)
+        cabeza.pack(anchor="w", padx=12, pady=(8, 0))
+        tk.Label(cabeza, text=icono, font=(e.FUENTE, 18), bg=e.BLANCO,
+                 fg=e.VERDE if permitido else e.GRIS).pack(side="left")
+        tk.Label(cabeza, text=titulo, font=e.F_SUBTITULO, bg=e.BLANCO, fg=e.CAFE_OSCURO).pack(side="left", padx=6)
+        tk.Label(tarjeta, text=texto, font=e.F_PEQUENA, bg=e.BLANCO, fg=e.GRIS, justify="left",
+                 wraplength=190).pack(anchor="w", padx=12, pady=(2, 6))
+        b = e.boton(tarjeta, "Abrir" if permitido else "Sin permiso", lambda n=entidad: self.abrir_gestion(n),
+                    e.VERDE if permitido else e.GRIS, fuente=e.F_PEQUENA)
+        b.pack(anchor="w", padx=12, pady=(0, 8))
+        if not permitido:
+            e.deshabilitar(b)
+
     def actualizar_estadisticas(self):
         if not getattr(self, "frame_stats", None) or not self.frame_stats.winfo_exists():
             return
@@ -230,17 +243,19 @@ class Aplicacion(tk.Tk):
             hijo.destroy()
         resultado = LogicaAcceso.resumen_panel()
         datos = resultado["datos"] if resultado["exito"] else {}
-        tarjetas = [("Personas activas", datos.get("personas", "—"), e.VERDE),
-                    ("Usuarios activos", datos.get("usuarios", "—"), e.CAFE),
-                    ("Perfiles activos", datos.get("perfiles", "—"), e.DORADO)]
+        tarjetas = [("Productores activos", datos.get("productores", "—"), e.VERDE),
+                    ("Fincas activas", datos.get("fincas", "—"), e.VERDE_OSCURO),
+                    ("Cooperativas activas", datos.get("cooperativas", "—"), e.CAFE),
+                    ("Variedades de café", datos.get("variedades", "—"), e.DORADO),
+                    ("Usuarios activos", datos.get("usuarios", "—"), e.CAFE_CLARO)]
         for columna, (titulo, valor, color) in enumerate(tarjetas):
             t = tk.Frame(self.frame_stats, bg=color)
             t.grid(row=0, column=columna, sticky="nsew", padx=(0 if columna == 0 else 12, 0))
             self.frame_stats.columnconfigure(columna, weight=1)
-            tk.Label(t, text=str(valor), font=(e.FUENTE, 24, "bold"), bg=color, fg=e.BLANCO).pack(
-                anchor="w", padx=16, pady=(8, 0))
-            tk.Label(t, text=titulo, font=e.F_NORMAL, bg=color, fg=e.BLANCO).pack(anchor="w", padx=16,
-                                                                                  pady=(0, 10))
+            tk.Label(t, text=str(valor), font=(e.FUENTE, 20, "bold"), bg=color, fg=e.BLANCO).pack(
+                anchor="w", padx=14, pady=(6, 0))
+            tk.Label(t, text=titulo, font=e.F_NORMAL, bg=color, fg=e.BLANCO).pack(anchor="w", padx=14,
+                                                                                  pady=(0, 8))
 
     def abrir_gestion(self, entidad):
         permitidas = permisos_de(self.sesion["perfil"]).get(entidad)
@@ -248,7 +263,10 @@ class Aplicacion(tk.Tk):
             messagebox.showwarning("Permisos", f"Su perfil no tiene acceso a Gestión {entidad}.", parent=self)
             return
         abrir = {"Perfil": formularios.abrir_perfil, "Persona": formularios.abrir_persona,
-                 "Usuario": formularios.abrir_usuario}[entidad]
+                 "Usuario": formularios.abrir_usuario,
+                 "Productor": formularios.abrir_productor, "Finca": formularios.abrir_finca,
+                 "Cooperativa": formularios.abrir_cooperativa, "Asociacion": formularios.abrir_asociacion,
+                 "Variedad": formularios.abrir_variedad}[entidad]
         abrir(self, self.sesion, permitidas, al_cerrar=self.actualizar_estadisticas)
 
     def cerrar_sesion(self):
