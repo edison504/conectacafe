@@ -1,4 +1,5 @@
 import re
+import secrets
 from datetime import date, datetime
 from functools import wraps
 
@@ -6,7 +7,8 @@ import mysql.connector
 
 import correo
 from conexion import ErrorConexion
-from datos import (DatosAcceso, DatosAsociacion, DatosCooperativa, DatosFinca, DatosPerfil, DatosPersona,
+from datos import (ESTADOS_ACTIVOS, DatosAcceso, DatosAsociacion, DatosCatalogo, DatosCooperativa, DatosEntrega,
+                   DatosFinca, DatosListas, DatosLote, DatosMensaje, DatosNegocio, DatosPerfil, DatosPersona,
                    DatosProductor, DatosUbicacion, DatosUsuario, DatosVariedad)
 
 ACTIVO, INACTIVO = "Activo", "Inactivo"
@@ -27,18 +29,27 @@ PERMISOS = {
         "Cooperativa": TODAS,
         "Asociacion": TODAS,
         "Variedad": TODAS,
+        # Final
+        "Lote": TODAS,
+        "Catalogo": TODAS,
+        "Negocio": TODAS,
+        "Mensaje": SOLO_CONSULTA,
     },
     # HU-01 y HU-02: el productor consulta y modifica sus propios datos, y gestiona sus fincas.
     "Productor": {
         "Productor": {"Consultar", "Modificar", "Salir"},
         "Finca": TODAS,
         "Variedad": SOLO_CONSULTA,
+        "Lote": TODAS,                      # HU-06: Mi inventario
+        "Negocio": SOLO_CONSULTA,           # HU-07: acepta o rechaza; HU-08: programa entregas
     },
     # HU-04: el comprador de una cooperativa solicita asociaciones (quedan pendientes).
     "Comprador": {
         "Cooperativa": SOLO_CONSULTA,
         "Asociacion": {"Crear", "Consultar", "Guardar", "Salir"},
         "Variedad": SOLO_CONSULTA,
+        "Catalogo": SOLO_CONSULTA,          # HU-10
+        "Negocio": TODAS,                   # HU-07 y HU-09
     },
     # Cualquier otro perfil (por ejemplo "Persona") solo gestiona sus propios datos.
     "Persona": {
@@ -596,10 +607,12 @@ class LogicaProductor:
         if error:
             return error
         if estado_actual == ACTIVO:
-            # Reglas del Final (HU-06 y HU-07), cuando existan lotes y negocios:
-            # no inhabilitar con negocios Aceptados o En entrega, y ocultar sus lotes del catálogo.
+            negocios = DatosNegocio.contar("('Aceptado', 'En entrega')", documento=documento)
+            if negocios:
+                return _error(f"No se puede inhabilitar: el productor tiene {negocios} negocio(s) "
+                              "Aceptado(s) o En entrega.")
             DatosProductor.cambiar_estado(documento, INACTIVO)
-            return _ok("Productor inhabilitado (borrado lógico). El registro sigue en la base de datos.")
+            return _ok("Productor inhabilitado (borrado lógico). Sus lotes dejan de aparecer en el catálogo.")
         DatosProductor.cambiar_estado(documento, ACTIVO)
         return _ok("Productor activado nuevamente.")
 
@@ -739,7 +752,10 @@ class LogicaFinca:
         if not finca or not LogicaFinca._es_dueno(finca, sesion):
             return _error("Solo puede inhabilitar sus propias fincas.")
         if estado_actual == ACTIVO:
-            # Regla del Final (HU-06): no inhabilitar una finca con lotes disponibles o comprometidos.
+            ocupada = DatosLote.finca_ocupada(codigof)
+            if ocupada["disponibles"] or ocupada["en_negocios"]:
+                return _error("No se puede inhabilitar: la finca tiene lotes de café disponibles o "
+                              "comprometidos en negocios activos.")
             DatosFinca.cambiar_estado(codigof, INACTIVO)
             return _ok("Finca inhabilitada (borrado lógico). El registro sigue en la base de datos.")
         DatosFinca.cambiar_estado(codigof, ACTIVO)
@@ -833,7 +849,10 @@ class LogicaCooperativa:
         if error:
             return error
         if estado_actual == ACTIVO:
-            # Regla del Final (HU-07): no inhabilitar una cooperativa con negocios Aceptados o En entrega.
+            negocios = DatosNegocio.contar("('Aceptado', 'En entrega')", nit=nit)
+            if negocios:
+                return _error(f"No se puede inhabilitar: la cooperativa tiene {negocios} negocio(s) "
+                              "Aceptado(s) o En entrega.")
             DatosCooperativa.cambiar_estado(nit, INACTIVO)
             return _ok("Cooperativa inhabilitada (borrado lógico). El registro sigue en la base de datos.")
         DatosCooperativa.cambiar_estado(nit, ACTIVO)
@@ -1054,3 +1073,736 @@ class LogicaVariedad:
             return _ok("Variedad inhabilitada (borrado lógico). Ya no aparece para productores y compradores.")
         DatosVariedad.cambiar_estado(codigotv, ACTIVO)
         return _ok("Variedad activada nuevamente.")
+
+
+# =====================================================================
+# FINAL
+# =====================================================================
+import whatsapp  # noqa: E402  (se importa aquí para que el Parcial II no dependa de él)
+
+ESTADOS_NEGOCIO = ("Propuesto", "Aceptado", "Rechazado", "En entrega", "Completado", "Cancelado")
+
+
+def _entero(texto, etiqueta):
+    texto = str(texto if texto is not None else "").strip()
+    if not texto:
+        return None, f"El campo {etiqueta} es obligatorio."
+    if not re.fullmatch(r"\d+", texto):
+        return None, f"El campo {etiqueta} debe ser un número entero (sin decimales)."
+    return int(texto), None
+
+
+def _token():
+    return secrets.token_urlsafe(16)
+
+
+def _es(sesion, perfil):
+    return bool(sesion) and sesion.get("perfil") == perfil
+
+
+def puede_ver_negocio(negocio, sesion):
+    if es_administrador(sesion):
+        return True
+    if _es(sesion, "Comprador"):
+        return negocio["nit"] == sesion.get("nit")
+    if _es(sesion, "Productor"):
+        return negocio["documento"] == sesion.get("documento")
+    return False
+
+
+class LogicaListas:
+
+    @staticmethod
+    @controlar_errores_bd
+    def empaques():
+        return _ok("", [(f["idempaque"], f["descripcion"]) for f in DatosListas.empaques()])
+
+    @staticmethod
+    @controlar_errores_bd
+    def medios_pago():
+        return _ok("", [(f["idmedio"], f["descripcion"]) for f in DatosListas.medios_pago()])
+
+
+# ---------------------------------------------------------------------
+# HU-06 · Gestión de Inventario y Catálogo de Café
+# ---------------------------------------------------------------------
+class LogicaLote:
+    entidad = "Lote"
+
+    @staticmethod
+    def _es_dueno(lote, sesion):
+        return es_administrador(sesion) or (sesion or {}).get("documento") == lote["documento"]
+
+    @staticmethod
+    def _validar(datos, sesion, lote_actual=None):
+        codigoc = _texto(datos, "codigoc").upper()
+        descripcion = " ".join(_texto(datos, "descripcion").split())
+
+        if lote_actual is None:
+            if not codigoc:
+                return _error("El código del lote es obligatorio.")
+            if not CODIGO.match(codigoc):
+                return _error("El código debe tener de 2 a 15 caracteres: letras, números o guion (ejemplo: L-001).")
+            if DatosLote.obtener(codigoc):
+                return _error(f"Ya existe un lote con el código {codigoc}.")
+        else:
+            codigoc = lote_actual["codigoc"]
+
+        if len(descripcion) < 10:
+            return _error("Describa el tipo de café y sus datos de calidad "
+                          "(ejemplo: pergamino seco, factor 92, cosecha 2026).")
+        if len(descripcion) > 200:
+            return _error("La descripción no puede superar 200 caracteres.")
+
+        # Finca: debe ser del productor y estar activa.
+        codigof = datos.get("codigof")
+        if not codigof:
+            return _error("Seleccione la finca del lote.")
+        finca = DatosFinca.obtener(codigof)
+        if not finca:
+            return _error("La finca seleccionada no existe.")
+        if not es_administrador(sesion) and finca["documento"] != (sesion or {}).get("documento"):
+            return _error("Solo puede registrar lotes en sus propias fincas.")
+        if (lote_actual is None or lote_actual["codigof"] != codigof) and finca["estado"] != ACTIVO:
+            return _error("La finca seleccionada está inactiva.")
+
+        codigotv = datos.get("codigotv")
+        if not codigotv:
+            return _error("Seleccione la variedad del café.")
+        activas = {v["codigotv"] for v in DatosVariedad.listar("", solo_activas=True)}
+        if (lote_actual is None or lote_actual["codigotv"] != codigotv) and codigotv not in activas:
+            return _error("La variedad seleccionada no existe o está inactiva.")
+
+        idempaque = datos.get("idempaque")
+        if not idempaque:
+            return _error("Seleccione el tipo de empaque.")
+
+        peso, error = _numero(datos.get("peso"), "peso por empaque")
+        if error:
+            return _error(error)
+        if peso <= 0 or peso > 999999:
+            return _error("El peso es el peso de cada empaque en kg y debe ser mayor que cero.")
+
+        cantidad, error = _entero(datos.get("cantidad"), "cantidad de empaques")
+        if error:
+            return _error(error)
+        if cantidad <= 0:
+            return _error("La cantidad es el número de empaques y debe ser un entero mayor que cero.")
+
+        precio, error = _numero(datos.get("precio"), "precio por kg")
+        if error:
+            return _error(error)
+        if precio <= 0:
+            return _error("El precio de compra por kg debe ser mayor que cero.")
+
+        imagen, tipo = datos.get("imagen"), None
+        if imagen is None:
+            if lote_actual is None:
+                return _error("La imagen del lote es obligatoria. Elija un archivo JPG o PNG.")
+        else:
+            tipo = tipo_imagen(imagen)
+            if not tipo:
+                return _error("La imagen debe ser un archivo JPG o PNG.")
+            if len(imagen) > TAMANO_MAXIMO_IMAGEN:
+                return _error(f"La imagen pesa {len(imagen) / 1024 / 1024:.1f} MB. El máximo es 2 MB.")
+
+        if lote_actual is not None:
+            comprometida = int(lote_actual["comprometida"])
+            if cantidad < comprometida:
+                return _error(f"No se puede reducir la cantidad a {cantidad}: ya hay {comprometida} empaque(s) "
+                              "comprometidos en negocios aceptados.")
+            cambia_peso = round(float(lote_actual["peso"]), 2) != round(peso, 2)
+            cambia_empaque = int(lote_actual["idempaque"]) != int(idempaque)
+            if (cambia_peso or cambia_empaque) and DatosLote.tiene_negocios(codigoc):
+                return _error("No se puede cambiar el peso ni el empaque de un lote que ya tiene negocios.")
+
+        return _ok("", {"codigoc": codigoc, "descripcion": descripcion, "codigof": codigof, "codigotv": codigotv,
+                        "idempaque": int(idempaque), "peso": round(peso, 2), "cantidad": cantidad,
+                        "precio": round(precio, 2), "imagen": imagen, "imagen_tipo": tipo})
+
+    @staticmethod
+    @controlar_errores_bd
+    def listar(filtro="", sesion=None, filtros=None):
+        # "Mi inventario": el productor ve solo sus lotes; el administrador ve todos.
+        solo = None if es_administrador(sesion) else ((sesion or {}).get("documento") or "-")
+        filas = DatosLote.listar((filtro or "").strip(), solo)
+        for fila in filas:
+            fila["comprometida"] = int(fila["comprometida"])
+            fila["disponible"] = int(fila["disponible"])
+        return _ok("", filas)
+
+    @staticmethod
+    @controlar_errores_bd
+    def imagen(codigoc):
+        return _ok("", DatosLote.imagen(codigoc))
+
+    @staticmethod
+    @controlar_errores_bd
+    def guardar(datos, sesion=None):
+        if not (es_administrador(sesion) or _es(sesion, "Productor")):
+            return _error("Solo los productores registran lotes de café.")
+        validacion = LogicaLote._validar(datos, sesion)
+        if not validacion["exito"]:
+            return validacion
+        codigo = DatosLote.insertar(validacion["datos"])
+        return _ok(f"Lote {codigo} registrado con estado Activo.", codigo)
+
+    @staticmethod
+    @controlar_errores_bd
+    def modificar(codigoc, datos, sesion=None):
+        lote = DatosLote.obtener(codigoc)
+        if not lote:
+            return _error("El lote no existe.")
+        if not LogicaLote._es_dueno(lote, sesion):
+            return _error("Solo puede modificar sus propios lotes.")
+        validacion = LogicaLote._validar(datos, sesion, lote)
+        if not validacion["exito"]:
+            return validacion
+        DatosLote.actualizar(codigoc, validacion["datos"])
+        mensaje = "Lote modificado correctamente."
+        if round(float(lote["precio"]), 2) != validacion["datos"]["precio"]:
+            mensaje += " El nuevo precio aplica solo a los negocios nuevos."
+        return _ok(mensaje, codigoc)
+
+    @staticmethod
+    @controlar_errores_bd
+    def cambiar_estado(codigoc, estado_actual, sesion=None):
+        lote = DatosLote.obtener(codigoc)
+        if not lote or not LogicaLote._es_dueno(lote, sesion):
+            return _error("Solo puede inhabilitar sus propios lotes.")
+        if estado_actual == ACTIVO:
+            DatosLote.cambiar_estado(codigoc, INACTIVO)
+            return _ok("Lote inhabilitado (borrado lógico). Ya no aparece en el listado de disponibles, "
+                       "pero se conserva en los negocios anteriores.")
+        DatosLote.cambiar_estado(codigoc, ACTIVO)
+        return _ok("Lote activado nuevamente.")
+
+    @staticmethod
+    @controlar_errores_bd
+    def opciones_finca(sesion, codigo_lote=None):
+        filas = DatosFinca.listar("", solo_documento=None if es_administrador(sesion) else
+                                  ((sesion or {}).get("documento") or "-"))
+        actual = None
+        if codigo_lote:
+            lote = DatosLote.obtener(codigo_lote)
+            actual = lote["codigof"] if lote else None
+        return _ok("", [(f["codigof"], f"{f['nombre']} ({f['codigof']})" +
+                         ("" if es_administrador(sesion) is False else f" · {f['productor']}"))
+                        for f in filas if f["estado"] == ACTIVO or f["codigof"] == actual])
+
+    @staticmethod
+    @controlar_errores_bd
+    def opciones_variedad(codigo_lote=None):
+        filas = DatosVariedad.listar("")
+        actual = None
+        if codigo_lote:
+            lote = DatosLote.obtener(codigo_lote)
+            actual = lote["codigotv"] if lote else None
+        return _ok("", [(f["codigotv"], f["descripcion"]) for f in filas
+                        if f["estado"] == ACTIVO or f["codigotv"] == actual])
+
+
+# ---------------------------------------------------------------------
+# HU-10 · Listado detallado de lotes disponibles
+# ---------------------------------------------------------------------
+class LogicaCatalogo:
+
+    @staticmethod
+    @controlar_errores_bd
+    def listar(sesion, texto="", codigotv=None, iddepartamento=None, idmunicipio=None, nit=None,
+               precio_min="", precio_max="", orden="fecha", descendente=True, incluir_todos=False):
+        if not (es_administrador(sesion) or _es(sesion, "Comprador")):
+            return _error("El listado de lotes es para compradores y el administrador.")
+        minimo = maximo = None
+        if str(precio_min).strip():
+            minimo, error = _numero(precio_min, "precio mínimo")
+            if error:
+                return _error(error)
+        if str(precio_max).strip():
+            maximo, error = _numero(precio_max, "precio máximo")
+            if error:
+                return _error(error)
+        if minimo is not None and maximo is not None and minimo > maximo:
+            return _error("El precio mínimo no puede ser mayor que el precio máximo.")
+        filas = DatosCatalogo.listar(
+            texto=(texto or "").strip(), nit_comprador=(sesion or {}).get("nit"),
+            incluir_todos=bool(incluir_todos) and es_administrador(sesion), codigotv=codigotv,
+            iddepartamento=iddepartamento, idmunicipio=idmunicipio, nit=nit, precio_min=minimo,
+            precio_max=maximo, orden=orden, descendente=descendente)
+        totales = {}
+        for fila in filas:
+            fila["disponible"] = int(fila["disponible"])
+            fila["kg_disponibles"] = round(float(fila["kg_disponibles"]), 2)
+            fila["asociado"] = bool(fila["asociado"])
+            if fila["disponible"] > 0 and fila["estado"] == ACTIVO:
+                totales[fila["variedad"]] = totales.get(fila["variedad"], 0) + fila["kg_disponibles"]
+        return _ok("", {"filas": filas, "totales": dict(sorted(totales.items()))})
+
+    @staticmethod
+    @controlar_errores_bd
+    def opciones_variedad():
+        return _ok("", [(f["codigotv"], f["descripcion"]) for f in DatosVariedad.listar("", solo_activas=True)])
+
+
+# ---------------------------------------------------------------------
+# HU-07 · Gestión de Emparejamiento Comercial con Detalle
+# ---------------------------------------------------------------------
+class LogicaNegocio:
+
+    @staticmethod
+    def _validar(datos, sesion):
+        """Valida el negocio y calcula subtotales y total. Devuelve cabecera y líneas listas para guardar."""
+        documento = datos.get("documento")
+        if not documento:
+            return _error("Seleccione el productor.")
+        productor = DatosProductor.obtener(documento)
+        if not productor or productor["estado"] != ACTIVO:
+            return _error("El productor no existe o está inactivo.")
+
+        medios = dict((i, d) for i, d in ((f["idmedio"], f["descripcion"]) for f in DatosListas.medios_pago()))
+        idmedio = datos.get("idmedio")
+        if not idmedio or int(idmedio) not in medios:
+            return _error("Seleccione el medio de pago de la lista.")
+
+        descripcion = " ".join(_texto(datos, "descripcion").split())
+        if len(descripcion) > 250:
+            return _error("La descripción no puede superar 250 caracteres.")
+
+        lineas = datos.get("lineas") or []
+        if not lineas:
+            return _error("Agregue al menos un lote al detalle del negocio.")
+        vistos, listas, total = set(), [], 0.0
+        for linea in lineas:
+            codigoc = (linea.get("codigoc") or "").upper()
+            if codigoc in vistos:
+                return _error(f"El lote {codigoc} está repetido: un lote no puede ir en dos líneas.")
+            vistos.add(codigoc)
+            lote = DatosLote.obtener(codigoc)
+            if not lote:
+                return _error(f"El lote {codigoc} no existe.")
+            if lote["documento"] != documento:
+                return _error("Todos los lotes del negocio deben ser del mismo productor.")
+            if lote["estado"] != ACTIVO or lote["estado_finca"] != ACTIVO:
+                return _error(f"El lote {codigoc} no está disponible (lote o finca inactivos).")
+            cantidad, error = _entero(linea.get("cantidad"), f"cantidad del lote {codigoc}")
+            if error:
+                return _error(error)
+            if cantidad <= 0:
+                return _error(f"La cantidad del lote {codigoc} debe ser mayor que cero.")
+            disponible = int(lote["cantidad"]) - int(lote["comprometida"])
+            if cantidad > disponible:
+                return _error(f"El lote {codigoc} solo tiene {disponible} empaque(s) disponible(s).")
+            precio, error = _numero(str(linea.get("precio_kg")), f"precio por kg del lote {codigoc}")
+            if error:
+                return _error(error)
+            if precio <= 0:
+                return _error(f"El precio por kg del lote {codigoc} debe ser mayor que cero.")
+            peso = float(lote["peso"])
+            # Subtotal = cantidad × peso por empaque × precio por kg (lo calcula el sistema).
+            subtotal = round(cantidad * peso * precio, 2)
+            total += subtotal
+            listas.append({"codigoc": codigoc, "cantidad": cantidad, "peso": peso, "precio_kg": round(precio, 2),
+                           "subtotal": subtotal, "lote": lote["descripcion"], "variedad": lote["variedad"],
+                           "empaque": lote["empaque"]})
+        cabecera = {"documento": documento, "idmedio": int(idmedio), "medio": medios[int(idmedio)],
+                    "descripcion": descripcion or None, "valor_total": round(total, 2)}
+        return _ok("", {"cabecera": cabecera, "lineas": listas})
+
+    @staticmethod
+    def _notificar_productor(idnegocio, modificado=False):
+        negocio = DatosNegocio.obtener(idnegocio)
+        lineas = DatosNegocio.detalle(idnegocio)
+        detalle = "\n".join(
+            f"• {l['codigoc']} {l['variedad']}: {l['cantidad']} {l['empaque'].lower()} de {float(l['peso']):g} kg "
+            f"a {whatsapp.pesos(l['precio_kg'])}/kg = {whatsapp.pesos(l['subtotal'])}" for l in lineas)
+        titulo = "modificó el negocio" if modificado else "le propone un negocio"
+        texto = (f"☕ Café Conecta\nHola {negocio['productor']}, la {negocio['cooperativa']} {titulo} "
+                 f"{negocio['codigoe']}:\n{detalle}\nValor total: {whatsapp.pesos(negocio['valor_total'])}\n"
+                 f"Medio de pago: {negocio['medio_pago']}\n"
+                 f"Para aceptar o rechazar: {whatsapp.enlace('n', negocio['token'])}\n"
+                 f"(o ingrese a Café Conecta › Negocios › {negocio['codigoe']})")
+        return whatsapp.enviar(negocio["telefono_productor"], negocio["productor"],
+                               "Negocio modificado" if modificado else "Negocio propuesto", negocio["codigoe"], texto)
+
+    @staticmethod
+    def _notificar_cooperativa(negocio, texto, tipo):
+        return whatsapp.enviar(negocio["telefono_cooperativa"], negocio["cooperativa"], tipo, negocio["codigoe"],
+                               "☕ Café Conecta\n" + texto)
+
+    @staticmethod
+    def _texto_resultado_envio(resultado):
+        estado, detalle = resultado
+        if estado == "Error":
+            return f"\n\nAviso de WhatsApp no enviado: {detalle}"
+        return f"\n\nWhatsApp: {detalle}"
+
+    @staticmethod
+    @controlar_errores_bd
+    def listar(filtro="", sesion=None):
+        if es_administrador(sesion):
+            filas = DatosNegocio.listar(filtro)
+        elif _es(sesion, "Comprador"):
+            filas = DatosNegocio.listar(filtro, nit=sesion.get("nit"))       # "Mis negocios"
+        elif _es(sesion, "Productor"):
+            filas = DatosNegocio.listar(filtro, documento=sesion.get("documento"))  # los que le proponen
+        else:
+            filas = []
+        return _ok("", filas)
+
+    @staticmethod
+    @controlar_errores_bd
+    def detalle(idnegocio, sesion=None):
+        negocio = DatosNegocio.obtener(idnegocio)
+        if not negocio or not puede_ver_negocio(negocio, sesion):
+            return _error("No tiene acceso a ese negocio.")
+        return _ok("", {"negocio": negocio, "lineas": DatosNegocio.detalle(idnegocio),
+                        "entregas": DatosEntrega.de_negocio(idnegocio)})
+
+    @staticmethod
+    @controlar_errores_bd
+    def lotes_de_productor(documento, sesion=None):
+        """Lotes disponibles del productor para armar el detalle, marcando si está asociado a la cooperativa."""
+        filas = DatosLote.de_productor_disponibles(documento)
+        asociado = bool(sesion and sesion.get("nit") and DatosAsociacion.vigente(documento, sesion["nit"])
+                        and DatosAsociacion.vigente(documento, sesion["nit"])["estado"] == ACTIVO)
+        for fila in filas:
+            fila["disponible"] = int(fila["disponible"])
+            fila["asociado"] = asociado
+        return _ok("", filas)
+
+    @staticmethod
+    @controlar_errores_bd
+    def guardar(datos, sesion=None):
+        if not _es(sesion, "Comprador"):
+            return _error("Los negocios los propone un comprador de una cooperativa.")
+        cooperativa = DatosCooperativa.obtener(sesion.get("nit"))
+        if not cooperativa or cooperativa["estado"] != ACTIVO:
+            return _error("Su cooperativa está inactiva.")
+        validacion = LogicaNegocio._validar(datos, sesion)
+        if not validacion["exito"]:
+            return validacion
+        cabecera = dict(validacion["datos"]["cabecera"], nit=sesion["nit"], idusuario=sesion["idusuario"],
+                        token=_token())
+        idnegocio = DatosNegocio.insertar(cabecera, validacion["datos"]["lineas"])
+        negocio = DatosNegocio.obtener(idnegocio)
+        envio = LogicaNegocio._notificar_productor(idnegocio)
+        return _ok(f"Negocio {negocio['codigoe']} registrado en estado Propuesto por "
+                   f"{whatsapp.pesos(negocio['valor_total'])}. El productor fue notificado para aceptarlo o "
+                   f"rechazarlo." + LogicaNegocio._texto_resultado_envio(envio), idnegocio)
+
+    @staticmethod
+    @controlar_errores_bd
+    def modificar(idnegocio, datos, sesion=None):
+        negocio = DatosNegocio.obtener(idnegocio)
+        if not negocio or not _es(sesion, "Comprador") or negocio["nit"] != sesion.get("nit"):
+            return _error("Solo el comprador de la cooperativa puede modificar este negocio.")
+        if negocio["estado_negocio"] != "Propuesto" or negocio["estado"] != ACTIVO:
+            return _error("Solo se puede modificar un negocio en estado Propuesto.")
+        datos = dict(datos, documento=negocio["documento"])
+        validacion = LogicaNegocio._validar(datos, sesion)
+        if not validacion["exito"]:
+            return validacion
+        DatosNegocio.actualizar(idnegocio, validacion["datos"]["cabecera"], validacion["datos"]["lineas"])
+        envio = LogicaNegocio._notificar_productor(idnegocio, modificado=True)
+        return _ok(f"Negocio {negocio['codigoe']} modificado. Se notificó de nuevo al productor."
+                   + LogicaNegocio._texto_resultado_envio(envio), idnegocio)
+
+    @staticmethod
+    @controlar_errores_bd
+    def cancelar(idnegocio, sesion=None):
+        """Borrado lógico: el negocio pasa a Cancelado (estado Anulado) y lo reservado vuelve al inventario."""
+        negocio = DatosNegocio.obtener(idnegocio)
+        if not negocio:
+            return _error("El negocio no existe.")
+        es_suyo = _es(sesion, "Comprador") and negocio["nit"] == sesion.get("nit")
+        if not (es_suyo or es_administrador(sesion)):
+            return _error("Solo el comprador de la cooperativa puede cancelar este negocio.")
+        if negocio["estado"] != ACTIVO or negocio["estado_negocio"] not in ("Propuesto", "Aceptado", "En entrega"):
+            return _error(f"No se puede cancelar un negocio en estado {negocio['estado_negocio']}.")
+        if DatosEntrega.recibidas_de_negocio(idnegocio):
+            return _error("No se puede cancelar: el negocio ya tiene entregas recibidas.")
+        DatosEntrega.cancelar_pendientes_de_negocio(idnegocio)
+        DatosNegocio.cambiar_estado(idnegocio, "Cancelado", estado="Anulado")
+        whatsapp.enviar(negocio["telefono_productor"], negocio["productor"], "Negocio cancelado", negocio["codigoe"],
+                        f"☕ Café Conecta\nLa {negocio['cooperativa']} canceló el negocio {negocio['codigoe']}. "
+                        "Las cantidades reservadas volvieron a su inventario.")
+        return _ok(f"Negocio {negocio['codigoe']} cancelado (anulado). Las cantidades reservadas volvieron al "
+                   "inventario y el negocio se conserva para la trazabilidad.")
+
+    @staticmethod
+    @controlar_errores_bd
+    def aceptar(idnegocio, sesion=None):
+        negocio = DatosNegocio.obtener(idnegocio)
+        if not negocio or not _es(sesion, "Productor") or negocio["documento"] != sesion.get("documento"):
+            return _error("Solo el productor del negocio puede aceptarlo.")
+        if negocio["estado_negocio"] != "Propuesto" or negocio["estado"] != ACTIVO:
+            return _error(f"Este negocio ya está {negocio['estado_negocio']}.")
+        for linea in DatosNegocio.detalle(idnegocio):
+            lote = DatosLote.obtener(linea["codigoc"])
+            disponible = int(lote["cantidad"]) - int(lote["comprometida"])
+            if lote["estado"] != ACTIVO or linea["cantidad"] > disponible:
+                return _error(f"No se puede aceptar: el lote {linea['codigoc']} ya no tiene {linea['cantidad']} "
+                              f"empaque(s) disponibles (quedan {max(disponible, 0)}).")
+        DatosNegocio.cambiar_estado(idnegocio, "Aceptado", respuesta=True)
+        LogicaNegocio._notificar_cooperativa(
+            negocio, f"{negocio['productor']} aceptó el negocio {negocio['codigoe']} por "
+                     f"{whatsapp.pesos(negocio['valor_total'])}. Pronto programará las entregas.", "Negocio aceptado")
+        return _ok(f"Negocio {negocio['codigoe']} aceptado. Las cantidades se descontaron de lo disponible en "
+                   "cada lote. Ahora puede programar las entregas.")
+
+    @staticmethod
+    @controlar_errores_bd
+    def rechazar(idnegocio, motivo, sesion=None):
+        negocio = DatosNegocio.obtener(idnegocio)
+        if not negocio or not _es(sesion, "Productor") or negocio["documento"] != sesion.get("documento"):
+            return _error("Solo el productor del negocio puede rechazarlo.")
+        if negocio["estado_negocio"] != "Propuesto" or negocio["estado"] != ACTIVO:
+            return _error(f"Este negocio ya está {negocio['estado_negocio']}.")
+        motivo = " ".join((motivo or "").split())
+        if len(motivo) < 5:
+            return _error("Indique el motivo del rechazo.")
+        DatosNegocio.cambiar_estado(idnegocio, "Rechazado", motivo=motivo[:250], respuesta=True)
+        LogicaNegocio._notificar_cooperativa(
+            negocio, f"{negocio['productor']} rechazó el negocio {negocio['codigoe']}. Motivo: {motivo}",
+            "Negocio rechazado")
+        return _ok(f"Negocio {negocio['codigoe']} rechazado.")
+
+    @staticmethod
+    def verificar_completado(idnegocio):
+        """Cuando todas las cantidades del negocio están recibidas, pasa a Completado."""
+        lineas = DatosNegocio.detalle(idnegocio)
+        if lineas and all(l["recibida"] >= l["cantidad"] for l in lineas):
+            DatosNegocio.cambiar_estado(idnegocio, "Completado")
+            return True
+        return False
+
+    @staticmethod
+    @controlar_errores_bd
+    def desde_enlace(tipo, valor, sesion):
+        """Resuelve un enlace o código de WhatsApp. Devuelve ('negocio', fila) o ('entrega', fila)."""
+        if tipo == "n" or (tipo == "codigo" and str(valor).startswith("NEG-")):
+            negocio = DatosNegocio.obtener(token=valor) if tipo == "n" else DatosNegocio.obtener(codigoe=valor)
+            if not negocio:
+                return _error("El enlace no corresponde a ningún negocio.")
+            if not puede_ver_negocio(negocio, sesion):
+                return _error("Este enlace es para otro usuario. Inicie sesión con la cuenta que recibió el mensaje.")
+            return _ok("", ("negocio", negocio))
+        entrega = DatosEntrega.obtener(token=valor) if tipo == "e" else DatosEntrega.obtener(code=valor)
+        if not entrega:
+            return _error("El enlace o código no corresponde a ningún negocio ni entrega.")
+        if not puede_ver_negocio(entrega, sesion):
+            return _error("Este enlace es para otro usuario. Inicie sesión con la cuenta que recibió el mensaje.")
+        return _ok("", ("entrega", entrega))
+
+
+# ---------------------------------------------------------------------
+# HU-08 · Programación de entregas  ·  HU-09 · Confirmación de recibido
+# ---------------------------------------------------------------------
+class LogicaEntrega:
+
+    @staticmethod
+    def _validar(datos, negocio, actual=None):
+        code = _texto(datos, "code").upper()
+        if actual is None:
+            if not code:
+                return _error("El código de la entrega es obligatorio.")
+            if not re.fullmatch(r"[A-Z0-9-]{2,20}", code):
+                return _error("El código debe tener de 2 a 20 caracteres: letras, números o guion (ejemplo: E-001).")
+            if DatosEntrega.obtener(code=code):
+                return _error(f"Ya existe una entrega con el código {code}.")
+        else:
+            code = actual["code"]
+
+        lineas = {l["iddetalle"]: l for l in DatosNegocio.detalle(negocio["idnegocio"])}
+        iddetalle = datos.get("iddetalle")
+        if not iddetalle or int(iddetalle) not in lineas:
+            return _error("Seleccione la línea del negocio (el lote) que va a entregar.")
+        linea = lineas[int(iddetalle)]
+
+        try:
+            fecha = datetime.strptime(_texto(datos, "fecha"), "%Y-%m-%d").date()
+        except ValueError:
+            return _error("La fecha debe tener el formato AAAA-MM-DD (ejemplo: 2026-12-05).")
+        try:
+            hora = datetime.strptime(_texto(datos, "hora"), "%H:%M").time()
+        except ValueError:
+            return _error("La hora debe tener el formato HH:MM en 24 horas (ejemplo: 14:30).")
+        if datetime.combine(fecha, hora) <= datetime.now():
+            return _error("La fecha y la hora de la entrega deben ser posteriores a este momento.")
+
+        cantidad, error = _entero(datos.get("cantidad"), "cantidad de empaques")
+        if error:
+            return _error(error)
+        if cantidad <= 0:
+            return _error("La cantidad de empaques debe ser un entero mayor que cero.")
+        ya = DatosEntrega.programado_linea(linea["iddetalle"], excluir_code=code if actual else None)
+        if ya + cantidad > linea["cantidad"]:
+            return _error(f"La línea {linea['codigoc']} tiene {linea['cantidad']} empaque(s) negociados y ya hay "
+                          f"{ya} en otras entregas. Puede programar máximo {linea['cantidad'] - ya}.")
+
+        lugar = " ".join(_texto(datos, "lugar").split())
+        if not lugar:
+            return _error("Indique el lugar de entrega (el punto de recibo de la cooperativa).")
+        if len(lugar) > 150:
+            return _error("El lugar no puede superar 150 caracteres.")
+        descripcion = " ".join(_texto(datos, "descripcion").split())
+        if len(descripcion) > 200:
+            return _error("La descripción no puede superar 200 caracteres.")
+
+        return _ok("", {"code": code, "iddetalle": linea["iddetalle"], "fecha": fecha.isoformat(),
+                        "hora": hora.strftime("%H:%M:00"), "cantidad": cantidad, "lugar": lugar,
+                        "descripcion": descripcion or None, "linea": linea})
+
+    @staticmethod
+    def _notificar_comprador(entrega, titulo, tipo):
+        texto = (f"☕ Café Conecta\n{titulo}\nEntrega {entrega['code']} · negocio {entrega['codigoe']}\n"
+                 f"Productor: {entrega['productor']}\nLote: {entrega['codigoc']} · {entrega['lote']}\n"
+                 f"Fecha: {entrega['fecha']}  Hora: {entrega['hora']}\nCantidad: {entrega['cantidad']} empaque(s)\n"
+                 f"Lugar: {entrega['lugar']}")
+        return whatsapp.enviar(entrega["telefono_cooperativa"], entrega["cooperativa"], tipo, entrega["code"], texto)
+
+    @staticmethod
+    def _negocio_del_productor(idnegocio, sesion):
+        negocio = DatosNegocio.obtener(idnegocio)
+        if not negocio or not _es(sesion, "Productor") or negocio["documento"] != sesion.get("documento"):
+            return None, _error("Solo el productor del negocio programa sus entregas.")
+        return negocio, None
+
+    @staticmethod
+    @controlar_errores_bd
+    def programar(idnegocio, datos, sesion=None):
+        negocio, error = LogicaEntrega._negocio_del_productor(idnegocio, sesion)
+        if error:
+            return error
+        if negocio["estado"] != ACTIVO or negocio["estado_negocio"] not in ("Aceptado", "En entrega"):
+            return _error("Solo se programan entregas de negocios Aceptados o En entrega.")
+        validacion = LogicaEntrega._validar(datos, negocio)
+        if not validacion["exito"]:
+            return validacion
+        datos_entrega = dict(validacion["datos"], token=_token())
+        DatosEntrega.insertar(datos_entrega)
+        if negocio["estado_negocio"] == "Aceptado":
+            DatosNegocio.cambiar_estado(idnegocio, "En entrega")   # al programar la primera entrega
+        entrega = DatosEntrega.obtener(code=datos_entrega["code"])
+        envio = LogicaEntrega._notificar_comprador(entrega, "Se programó una entrega de café:", "Entrega programada")
+        return _ok(f"Entrega {entrega['code']} programada." + LogicaNegocio._texto_resultado_envio(envio),
+                   entrega["code"])
+
+    @staticmethod
+    @controlar_errores_bd
+    def modificar(code, datos, sesion=None):
+        actual = DatosEntrega.obtener(code=code)
+        if not actual:
+            return _error("La entrega no existe.")
+        negocio, error = LogicaEntrega._negocio_del_productor(actual["idnegocio"], sesion)
+        if error:
+            return error
+        if actual["estado_entrega"] != "Programada":
+            return _error("Solo se pueden modificar entregas Programadas.")
+        validacion = LogicaEntrega._validar(datos, negocio, actual)
+        if not validacion["exito"]:
+            return validacion
+        DatosEntrega.actualizar(code, validacion["datos"])
+        entrega = DatosEntrega.obtener(code=code)
+        envio = LogicaEntrega._notificar_comprador(entrega, "Se MODIFICÓ una entrega de café:", "Entrega modificada")
+        return _ok(f"Entrega {code} modificada. Se notificó al comprador." +
+                   LogicaNegocio._texto_resultado_envio(envio), code)
+
+    @staticmethod
+    @controlar_errores_bd
+    def cancelar(code, sesion=None):
+        """Borrado lógico: la entrega pasa a Cancelada (estado Anulado) y su cantidad queda por programar."""
+        actual = DatosEntrega.obtener(code=code)
+        if not actual:
+            return _error("La entrega no existe.")
+        _, error = LogicaEntrega._negocio_del_productor(actual["idnegocio"], sesion)
+        if error:
+            return error
+        if actual["estado_entrega"] not in ("Programada", "En tránsito"):
+            return _error(f"No se puede cancelar una entrega {actual['estado_entrega']}.")
+        DatosEntrega.cambiar_estado(code, "Cancelada", estado="Anulado")
+        LogicaEntrega._notificar_comprador(actual, "Se CANCELÓ una entrega de café:", "Entrega cancelada")
+        return _ok(f"Entrega {code} cancelada. Sus {actual['cantidad']} empaque(s) quedan pendientes por programar.")
+
+    @staticmethod
+    @controlar_errores_bd
+    def en_transito(code, sesion=None):
+        actual = DatosEntrega.obtener(code=code)
+        if not actual:
+            return _error("La entrega no existe.")
+        _, error = LogicaEntrega._negocio_del_productor(actual["idnegocio"], sesion)
+        if error:
+            return error
+        if actual["estado_entrega"] != "Programada":
+            return _error("Solo una entrega Programada se puede marcar En tránsito.")
+        DatosEntrega.cambiar_estado(code, "En tránsito")
+        return _ok(f"Entrega {code} marcada En tránsito. A la hora programada el comprador recibirá un "
+                   "WhatsApp para confirmar el recibido.")
+
+    @staticmethod
+    @controlar_errores_bd
+    def revisar_llegadas():
+        """HU-09: a la hora programada, avisa por WhatsApp al comprador de cada entrega En tránsito."""
+        enviados = 0
+        for entrega in DatosEntrega.llegadas_pendientes():
+            texto = (f"☕ Café Conecta\nLlegó la hora de la entrega {entrega['code']} (negocio {entrega['codigoe']}).\n"
+                     f"Productor: {entrega['productor']}\nLote: {entrega['codigoc']} · {entrega['lote']}\n"
+                     f"Cantidad esperada: {entrega['cantidad']} empaque(s)\n"
+                     f"Confirme lo recibido aquí: {whatsapp.enlace('e', entrega['token'])}\n"
+                     f"(o en Café Conecta › Negocios › Entregas › {entrega['code']})")
+            DatosEntrega.marcar_aviso(entrega["code"])
+            whatsapp.enviar(entrega["telefono_cooperativa"], entrega["cooperativa"], "Confirmar recibido",
+                            entrega["code"], texto)
+            enviados += 1
+        return _ok(f"{enviados} aviso(s) de llegada enviados.", enviados)
+
+    @staticmethod
+    @controlar_errores_bd
+    def confirmar(code, cantidad_recibida, novedad, sesion=None):
+        entrega = DatosEntrega.obtener(code=code)
+        if not entrega:
+            return _error("La entrega no existe.")
+        es_suyo = _es(sesion, "Comprador") and entrega["nit"] == sesion.get("nit")
+        if not (es_suyo or es_administrador(sesion)):
+            return _error("Solo el comprador de la cooperativa confirma el recibido.")
+        if entrega["estado_entrega"] == "Cancelada":
+            return _error("No se puede confirmar una entrega Cancelada.")
+        if entrega["estado_entrega"] in ("Recibida", "Recibida con novedad"):
+            return _error("Esta entrega ya fue confirmada. No se puede confirmar dos veces.")
+        if entrega["estado_entrega"] != "En tránsito":
+            return _error("La entrega todavía no está En tránsito.")
+        recibida, error = _entero(cantidad_recibida, "cantidad recibida")
+        if error:
+            return _error(error)
+        if recibida > entrega["cantidad"]:
+            return _error(f"La cantidad recibida no puede superar lo programado ({entrega['cantidad']}).")
+        novedad = " ".join((novedad or "").split())[:250] or None
+        estado = "Recibida" if recibida == entrega["cantidad"] and not novedad else "Recibida con novedad"
+        if not DatosEntrega.confirmar(code, recibida, novedad, estado, sesion["idusuario"]):
+            return _error("Esta entrega ya fue confirmada. No se puede confirmar dos veces.")
+
+        diferencia = entrega["cantidad"] - recibida
+        texto = (f"☕ Café Conecta\nLa {entrega['cooperativa']} confirmó el recibido de la entrega {code} "
+                 f"(negocio {entrega['codigoe']}): {recibida} de {entrega['cantidad']} empaque(s). Estado: {estado}.")
+        if novedad:
+            texto += f"\nNovedad: {novedad}"
+        if diferencia:
+            texto += f"\nQuedan {diferencia} empaque(s) pendientes por entregar en esa línea."
+        envio = whatsapp.enviar(entrega["telefono_productor"], entrega["productor"], "Recibido confirmado", code, texto)
+        completado = LogicaNegocio.verificar_completado(entrega["idnegocio"])
+        mensaje = f"Entrega {code} confirmada como {estado}."
+        if diferencia:
+            mensaje += f" La diferencia ({diferencia} empaque(s)) queda pendiente por entregar en esa línea."
+        if completado:
+            mensaje += f" Todas las cantidades llegaron: el negocio {entrega['codigoe']} pasó a Completado."
+        return _ok(mensaje + LogicaNegocio._texto_resultado_envio(envio))
+
+
+class LogicaMensaje:
+
+    @staticmethod
+    @controlar_errores_bd
+    def listar(filtro="", sesion=None, filtros=None):
+        if not es_administrador(sesion):
+            return _error("La bitácora de mensajes es solo para el administrador.")
+        return _ok("", DatosMensaje.listar((filtro or "").strip()))

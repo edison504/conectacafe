@@ -4,5 +4,6 @@
         "python": "\"/Library/Frameworks/Python.framework/Versions/3.13/bin/python3\" -u"
     },
     "code-runner.fileDirectoryAsCwd": true,
-    "code-runner.runInTerminal": true
+    "code-runner.runInTerminal": true,
+    "DockerRun.DisableDockerrc": true
 }

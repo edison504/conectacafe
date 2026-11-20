@@ -75,14 +75,20 @@ if not tabla_existe(cur, "usuario"):
     print("Creando la base de datos 'cafeconecta' desde cafeconecta.sql...")
     ejecutar_archivo(cur, "cafeconecta.sql")
     con.commit()
-    print("Base de datos creada. Usuarios: admin / admin123, productor1 / cafe2026, comprador1 / cafe2026")
-elif not tabla_existe(cur, "productor"):
-    print("La base del Parcial I existe. Agregando las tablas del Parcial II (sus datos se conservan)...")
-    ejecutar_archivo(cur, "actualizar_parcial2.sql")
-    con.commit()
-    print("Base de datos actualizada al Parcial II.")
+    print("Base de datos creada. Usuarios: admin / admin123, productor1, productor2 y comprador1 (clave cafe2026)")
 else:
-    print("La base de datos 'cafeconecta' ya tiene las tablas del Parcial II. No se modificó.")
+    if not tabla_existe(cur, "productor"):
+        print("La base del Parcial I existe. Agregando las tablas del Parcial II (sus datos se conservan)...")
+        ejecutar_archivo(cur, "actualizar_parcial2.sql")
+        con.commit()
+        print("Base de datos actualizada al Parcial II.")
+    if not tabla_existe(cur, "lote"):
+        print("Agregando las tablas del Final: lotes, negocios, entregas y mensajes (sus datos se conservan)...")
+        ejecutar_archivo(cur, "actualizar_final.sql")
+        con.commit()
+        print("Base de datos actualizada al Final.")
+    else:
+        print("La base de datos 'cafeconecta' ya tiene las tablas del Final. No se modificó.")
 con.close()
 
 # Guarda en config.py el puerto, el usuario y la contraseña que funcionaron.

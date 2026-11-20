@@ -1,9 +1,15 @@
+import queue
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
+import enlaces
 import estilos as e
 import formularios
-from negocio import LogicaAcceso, PERMISOS, permisos_de
+import ventanas_comercial
+import whatsapp
+from negocio import LogicaAcceso, LogicaEntrega, LogicaNegocio, PERMISOS, permisos_de
+
+REVISAR_LLEGADAS_MS = 30_000   # HU-09: cada 30 segundos se revisa si llegó la hora de alguna entrega
 
 
 # Módulos del panel principal: (entidad, ícono, título, descripción)
@@ -14,6 +20,12 @@ MODULOS = [
         ("Cooperativa", "⌂", "Cooperativas", "Organizaciones que compran el café."),
         ("Asociacion", "⇄", "Asociaciones", "Afiliación de productores a cooperativas."),
         ("Variedad", "❦", "Variedades", "Castillo, Caturra, Geisha… con su imagen."),
+    ]),
+    ("Ciclo comercial", [
+        ("Lote", "▦", "Lotes de café", "Inventario: café listo para vender, con su imagen."),
+        ("Catalogo", "▤", "Lotes disponibles", "Buscar café por variedad, zona y precio."),
+        ("Negocio", "⇆", "Negocios", "Proponer, aceptar y seguir negocios."),
+        ("Mensaje", "✉", "Mensajes", "Bitácora de avisos por WhatsApp."),
     ]),
     ("Administración del sistema", [
         ("Persona", "☺", "Personas", "Datos personales de quienes usan el sistema."),
@@ -31,7 +43,69 @@ class Aplicacion(tk.Tk):
         self.configure(bg=e.CREMA)
         e.configurar_estilos(self)
         self.sesion = None
+        self.pedido_pendiente = None    # enlace de WhatsApp que llegó antes de iniciar sesión
+        self.servidor_enlaces = enlaces.iniciar(whatsapp.configuracion_enlaces()["puerto"])
         self.mostrar_login()
+        self.after(500, self._revisar_pedidos)
+        self.after(5_000, self._revisar_llegadas)
+
+    # ------------------------------------------------------------------
+    # Enlaces de WhatsApp y avisos de llegada (HU-07 y HU-09)
+    # ------------------------------------------------------------------
+    def _revisar_pedidos(self):
+        try:
+            while True:
+                pedido = enlaces.PEDIDOS.get_nowait()
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+                if self.sesion:
+                    self._abrir_pedido(pedido)
+                else:
+                    self._dejar_pendiente(pedido)
+        except queue.Empty:
+            pass
+        self.after(500, self._revisar_pedidos)
+
+    def _revisar_llegadas(self):
+        try:
+            LogicaEntrega.revisar_llegadas()
+        except Exception:
+            pass
+        self.after(REVISAR_LLEGADAS_MS, self._revisar_llegadas)
+
+    def _dejar_pendiente(self, pedido):
+        self.pedido_pendiente = pedido
+        if getattr(self, "lbl_pedido", None) and self.lbl_pedido.winfo_exists():
+            self.lbl_pedido.config(text="🔗 Tiene un enlace de WhatsApp pendiente.\n"
+                                        "Inicie sesión con su cuenta para continuar.")
+
+    def _abrir_pedido(self, pedido):
+        tipo, valor = pedido
+        resultado = LogicaNegocio.desde_enlace(tipo, valor, self.sesion)
+        if not resultado["exito"]:
+            messagebox.showwarning("Enlace de WhatsApp", resultado["mensaje"], parent=self)
+            return
+        clase, fila = resultado["datos"]
+        if clase == "negocio":
+            ventanas_comercial.abrir_negocios(self, self.sesion, (), al_cerrar=self.actualizar_estadisticas,
+                                              abrir_id=fila["idnegocio"])
+        else:
+            ventana = ventanas_comercial.abrir_negocios(self, self.sesion, (), al_cerrar=self.actualizar_estadisticas,
+                                                        abrir_id=fila["idnegocio"])
+            entregas = ventana.f_entregas(code_inicial=fila["code"])
+            # El comprador llega desde el aviso de llegada: se abre de una vez la confirmación.
+            if entregas and entregas.puede_confirmar and fila["estado_entrega"] == "En tránsito":
+                self.after(300, entregas.f_confirmar)
+
+    def f_pegar_enlace(self):
+        texto = simpledialog.askstring("Enlace de WhatsApp", "Pegue el enlace que recibió por WhatsApp\n"
+                                       "o escriba el código (ej.: NEG-0001 o E-001):", parent=self)
+        tipo, valor = enlaces.interpretar(texto)
+        if not tipo:
+            return
+        self._dejar_pendiente((tipo, valor))
+        self.txt_usuario.focus_set()
 
     def _limpiar(self):
         for hijo in self.winfo_children():
@@ -98,6 +172,14 @@ class Aplicacion(tk.Tk):
                               fg=e.VERDE, cursor="hand2")
             enlace.pack(anchor="w", pady=3)
             enlace.bind("<Button-1>", lambda ev, c=comando: c())
+        enlace = tk.Label(enlaces, text="¿Le llegó un enlace por WhatsApp?", font=(e.FUENTE, 10, "underline"),
+                          bg=e.BLANCO, fg=e.CAFE, cursor="hand2")
+        enlace.pack(anchor="w", pady=3)
+        enlace.bind("<Button-1>", lambda ev: self.f_pegar_enlace())
+        self.lbl_pedido = tk.Label(caja, text="", font=e.F_PEQUENA, bg=e.BLANCO, fg=e.CEREZA, justify="left")
+        self.lbl_pedido.pack(anchor="w", pady=(6, 0))
+        if self.pedido_pendiente:
+            self._dejar_pendiente(self.pedido_pendiente)
 
         self.bind("<Return>", lambda ev: self.f_ingresar())
         (self.txt_contrasena if usuario_sugerido else self.txt_usuario).focus_set()
@@ -109,6 +191,9 @@ class Aplicacion(tk.Tk):
             return
         self.unbind("<Return>")
         self.mostrar_panel(resultado["datos"])
+        if self.pedido_pendiente:
+            pedido, self.pedido_pendiente = self.pedido_pendiente, None
+            self.after(300, lambda: self._abrir_pedido(pedido))
 
     def f_cancelar(self):
         """Limpia los campos del formulario."""
@@ -135,8 +220,8 @@ class Aplicacion(tk.Tk):
         permisos = permisos_de(sesion["perfil"])
         self.title("Café Conecta - Panel Principal")
         self.resizable(True, True)
-        e.centrar(self, 1180, 780)
-        self.minsize(1040, 720)
+        e.centrar(self, 1180, 790)
+        self.minsize(1040, 740)
 
         # Menú superior
         barra_menu = tk.Menu(self)
@@ -165,26 +250,26 @@ class Aplicacion(tk.Tk):
                  bg=e.CAFE_OSCURO, fg=e.DORADO).pack(side="right", padx=10)
 
         # Banner con paisaje cafetero
-        banner = tk.Canvas(self, height=150, highlightthickness=0, bg=e.CREMA)
+        banner = tk.Canvas(self, height=112, highlightthickness=0, bg=e.CREMA)
         banner.pack(fill="x")
-        subtitulo = {"Productor": "Mis datos, mis fincas y las variedades de café",
+        subtitulo = {"Productor": "Mis datos, mis fincas, mis lotes y los negocios que me proponen",
                      "Comprador": f"Comprador de {sesion.get('cooperativa') or 'su cooperativa'}"}.get(
             sesion["perfil"], "Panel de gestión cafetera · Sector agropecuario")
 
         def dibujar_banner(_evento=None):
             ancho = max(banner.winfo_width(), 900)
-            e.paisaje_cafetero(banner, ancho, 150, con_taza=False, nivel=0.30)
-            e.rama_cafeto(banner, ancho - 10, 148, 0.75, invertir=True)
-            e.taza(banner, ancho * 0.58, 72, 0.6)
-            banner.create_text(32, 38, anchor="w", text=f"¡Bienvenido(a), {sesion['nombre'].split()[0]}!",
+            e.paisaje_cafetero(banner, ancho, 112, con_taza=False, nivel=0.30)
+            e.rama_cafeto(banner, ancho - 10, 110, 0.65, invertir=True)
+            e.taza(banner, ancho * 0.58, 56, 0.5)
+            banner.create_text(32, 30, anchor="w", text=f"¡Bienvenido(a), {sesion['nombre'].split()[0]}!",
                                font=(e.FUENTE, 24, "bold"), fill=e.CAFE_OSCURO)
-            banner.create_text(34, 70, anchor="w", font=(e.FUENTE, 12), fill=e.CAFE_OSCURO, text=subtitulo)
-            banner.create_text(34, 92, anchor="w", font=(e.FUENTE, 10, "italic"), fill=e.CAFE,
+            banner.create_text(34, 60, anchor="w", font=(e.FUENTE, 12), fill=e.CAFE_OSCURO, text=subtitulo)
+            banner.create_text(34, 82, anchor="w", font=(e.FUENTE, 10, "italic"), fill=e.CAFE,
                                text="Seleccione un módulo en las tarjetas de abajo o en el menú Gestión.")
         banner.bind("<Configure>", dibujar_banner)
 
         cuerpo = tk.Frame(self, bg=e.CREMA)
-        cuerpo.pack(fill="both", expand=True, padx=24, pady=12)
+        cuerpo.pack(fill="both", expand=True, padx=24, pady=8)
 
         # Tarjetas de estadísticas
         self.frame_stats = tk.Frame(cuerpo, bg=e.CREMA)
@@ -194,31 +279,13 @@ class Aplicacion(tk.Tk):
         # Tarjetas de módulos, en dos grupos
         for grupo, modulos_grupo in MODULOS:
             tk.Label(cuerpo, text=grupo, font=e.F_SUBTITULO, bg=e.CREMA,
-                     fg=e.CAFE_OSCURO).pack(anchor="w", pady=(10, 4))
+                     fg=e.CAFE_OSCURO).pack(anchor="w", pady=(8, 3))
             fila_tarjetas = tk.Frame(cuerpo, bg=e.CREMA)
             fila_tarjetas.pack(fill="x")
             for columna in range(5):
                 fila_tarjetas.columnconfigure(columna, weight=1, uniform="tarjetas")
             for columna, (entidad, icono, titulo, texto) in enumerate(modulos_grupo):
                 self._tarjeta_modulo(fila_tarjetas, columna, entidad, icono, titulo, texto, entidad in permisos)
-
-        # Ciclo del café (franja informativa)
-        ciclo = tk.Canvas(cuerpo, height=62, bg=e.CREMA, highlightthickness=0)
-        ciclo.pack(fill="x", pady=(8, 0))
-
-        def dibujar_ciclo(_evento=None):
-            ciclo.delete("all")
-            pasos = ["Siembra", "Cultivo", "Cosecha", "Beneficio", "Secado", "Tostión", "Taza"]
-            ancho = max(ciclo.winfo_width(), 800)
-            paso_x = ancho / len(pasos)
-            ciclo.create_line(paso_x / 2, 24, ancho - paso_x / 2, 24, fill=e.CAFE_CLARO, width=3, dash=(6, 4))
-            for i, nombre in enumerate(pasos):
-                x = paso_x * i + paso_x / 2
-                color = e.CEREZA if nombre == "Cosecha" else (e.CAFE_OSCURO if i >= 5 else e.VERDE)
-                ciclo.create_oval(x - 14, 10, x + 14, 38, fill=color, outline=e.BLANCO, width=3)
-                ciclo.create_text(x, 24, text=str(i + 1), fill=e.BLANCO, font=e.F_NEGRITA)
-                ciclo.create_text(x, 54, text=nombre, fill=e.CAFE_OSCURO, font=e.F_PEQUENA)
-        ciclo.bind("<Configure>", dibujar_ciclo)
 
     def _tarjeta_modulo(self, contenedor, columna, entidad, icono, titulo, texto, permitido):
         tarjeta = tk.Frame(contenedor, bg=e.BLANCO, highlightbackground=e.CREMA_OSCURO, highlightthickness=1)
@@ -247,6 +314,8 @@ class Aplicacion(tk.Tk):
                     ("Fincas activas", datos.get("fincas", "—"), e.VERDE_OSCURO),
                     ("Cooperativas activas", datos.get("cooperativas", "—"), e.CAFE),
                     ("Variedades de café", datos.get("variedades", "—"), e.DORADO),
+                    ("Lotes con café", datos.get("lotes", "—"), "#827717"),
+                    ("Negocios en curso", datos.get("negocios", "—"), e.CEREZA),
                     ("Usuarios activos", datos.get("usuarios", "—"), e.CAFE_CLARO)]
         for columna, (titulo, valor, color) in enumerate(tarjetas):
             t = tk.Frame(self.frame_stats, bg=color)
@@ -266,7 +335,9 @@ class Aplicacion(tk.Tk):
                  "Usuario": formularios.abrir_usuario,
                  "Productor": formularios.abrir_productor, "Finca": formularios.abrir_finca,
                  "Cooperativa": formularios.abrir_cooperativa, "Asociacion": formularios.abrir_asociacion,
-                 "Variedad": formularios.abrir_variedad}[entidad]
+                 "Variedad": formularios.abrir_variedad, "Lote": formularios.abrir_lote,
+                 "Catalogo": ventanas_comercial.abrir_catalogo, "Negocio": ventanas_comercial.abrir_negocios,
+                 "Mensaje": ventanas_comercial.abrir_mensajes}[entidad]
         abrir(self, self.sesion, permitidas, al_cerrar=self.actualizar_estadisticas)
 
     def cerrar_sesion(self):

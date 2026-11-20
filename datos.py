@@ -97,7 +97,14 @@ class DatosAcceso:
               (SELECT COUNT(*) FROM productor   WHERE estado = 'Activo') AS productores,
               (SELECT COUNT(*) FROM finca       WHERE estado = 'Activo') AS fincas,
               (SELECT COUNT(*) FROM cooperativa WHERE estado = 'Activo') AS cooperativas,
-              (SELECT COUNT(*) FROM variedad    WHERE estado = 'Activo') AS variedades
+              (SELECT COUNT(*) FROM variedad    WHERE estado = 'Activo') AS variedades,
+              (SELECT COUNT(*) FROM lote l WHERE l.estado = 'Activo'
+                 AND l.cantidad > COALESCE((SELECT SUM(d.cantidad) FROM detalle_negocio d
+                        INNER JOIN negocio n ON n.idnegocio = d.idnegocio
+                        WHERE d.codigoc = l.codigoc AND n.estado = 'Activo'
+                          AND n.estado_negocio IN ('Aceptado', 'En entrega', 'Completado')), 0)) AS lotes,
+              (SELECT COUNT(*) FROM negocio WHERE estado = 'Activo'
+                 AND estado_negocio IN ('Propuesto', 'Aceptado', 'En entrega')) AS negocios
         """
         return _consultar(sql, uno=True)
 
@@ -394,7 +401,9 @@ class DatosFinca:
             SELECT f.codigof, f.nombre, CAST(f.area AS CHAR) AS area, CAST(f.temperatura AS CHAR) AS temperatura,
                    f.telefono, f.direccion, f.idmunicipio, m.nombre AS municipio,
                    d.iddepartamento, d.nombre AS departamento,
-                   f.documento, CONCAT_WS(' ', per.nom1, per.apell1) AS productor, f.estado
+                   f.documento, CONCAT_WS(' ', per.nom1, per.apell1) AS productor,
+                   (SELECT COUNT(*) FROM lote l WHERE l.codigof = f.codigof AND l.estado = 'Activo') AS lotes,
+                   f.estado
             FROM finca f
             INNER JOIN municipio m    ON m.idmunicipio = f.idmunicipio
             INNER JOIN departamento d ON d.iddepartamento = m.iddepartamento
@@ -648,4 +657,477 @@ class DatosVariedad:
     @staticmethod
     def cambiar_estado(codigotv, estado):
         return _ejecutar("UPDATE variedad SET estado = %s WHERE codigotv = %s", (estado, codigotv))
+
+
+# =====================================================================
+# FINAL
+# =====================================================================
+ESTADOS_QUE_COMPROMETEN = "('Aceptado', 'En entrega', 'Completado')"
+ESTADOS_ACTIVOS = "('Propuesto', 'Aceptado', 'En entrega')"
+
+# Empaques de un lote ya comprometidos en negocios Aceptados, En entrega o Completados.
+SQL_COMPROMETIDA = f"""(SELECT COALESCE(SUM(dn.cantidad), 0)
+        FROM detalle_negocio dn INNER JOIN negocio ng ON ng.idnegocio = dn.idnegocio
+        WHERE dn.codigoc = l.codigoc AND ng.estado = 'Activo'
+          AND ng.estado_negocio IN {ESTADOS_QUE_COMPROMETEN})"""
+
+
+class DatosListas:
+
+    @staticmethod
+    def empaques():
+        return _consultar("SELECT idempaque, descripcion FROM empaque WHERE estado = 'Activo' ORDER BY descripcion")
+
+    @staticmethod
+    def medios_pago():
+        return _consultar("SELECT idmedio, descripcion FROM medio_pago WHERE estado = 'Activo' ORDER BY idmedio")
+
+
+# ---------------------------------------------------------------------
+# HU-06 · Inventario de lotes de café
+# ---------------------------------------------------------------------
+class DatosLote:
+    CAMPOS = ("codigoc", "descripcion", "peso", "cantidad", "precio", "codigof", "codigotv", "idempaque")
+
+    @staticmethod
+    def listar(filtro="", solo_documento=None):
+        sql = f"""
+            SELECT l.codigoc, l.descripcion, l.codigof, f.nombre AS finca, f.documento,
+                   l.codigotv, v.descripcion AS variedad, l.idempaque, e.descripcion AS empaque,
+                   CAST(l.peso AS CHAR) AS peso, l.cantidad, CAST(l.precio AS CHAR) AS precio,
+                   {SQL_COMPROMETIDA} AS comprometida,
+                   l.cantidad - {SQL_COMPROMETIDA} AS disponible,
+                   CAST(l.fecha_registro AS CHAR) AS fecha_registro, l.imagen_tipo, l.estado
+            FROM lote l
+            INNER JOIN finca f    ON f.codigof = l.codigof
+            INNER JOIN variedad v ON v.codigotv = l.codigotv
+            INNER JOIN empaque e  ON e.idempaque = l.idempaque
+            WHERE (l.codigoc LIKE %s OR l.descripcion LIKE %s OR v.descripcion LIKE %s OR f.nombre LIKE %s)
+        """
+        parametros = [_filtro_texto(filtro)] * 4
+        if solo_documento is not None:
+            sql += " AND f.documento = %s"
+            parametros.append(solo_documento)
+        sql += " ORDER BY l.fecha_registro DESC"
+        return _consultar(sql, tuple(parametros))
+
+    @staticmethod
+    def obtener(codigoc):
+        sql = f"""
+            SELECT l.codigoc, l.descripcion, l.peso, l.cantidad, l.precio, l.codigof, l.codigotv, l.idempaque,
+                   l.estado, f.documento, f.estado AS estado_finca, pr.estado AS estado_productor,
+                   v.descripcion AS variedad, e.descripcion AS empaque,
+                   {SQL_COMPROMETIDA} AS comprometida
+            FROM lote l
+            INNER JOIN finca f     ON f.codigof = l.codigof
+            INNER JOIN productor pr ON pr.documento = f.documento
+            INNER JOIN variedad v  ON v.codigotv = l.codigotv
+            INNER JOIN empaque e   ON e.idempaque = l.idempaque
+            WHERE l.codigoc = %s
+        """
+        return _consultar(sql, (codigoc,), uno=True)
+
+    @staticmethod
+    def imagen(codigoc):
+        fila = _consultar("SELECT imagen FROM lote WHERE codigoc = %s", (codigoc,), uno=True)
+        return bytes(fila["imagen"]) if fila and fila["imagen"] is not None else None
+
+    @staticmethod
+    def tiene_negocios(codigoc):
+        """True si el lote está en algún negocio vigente (no rechazado, cancelado ni anulado)."""
+        fila = _consultar(f"""SELECT COUNT(*) AS total FROM detalle_negocio d
+                              INNER JOIN negocio n ON n.idnegocio = d.idnegocio
+                              WHERE d.codigoc = %s AND n.estado = 'Activo'
+                                AND n.estado_negocio IN ('Propuesto', 'Aceptado', 'En entrega', 'Completado')""",
+                          (codigoc,), uno=True)
+        return fila["total"] > 0
+
+    @staticmethod
+    def insertar(datos):
+        _ejecutar("""INSERT INTO lote (codigoc, descripcion, imagen, imagen_tipo, peso, cantidad, precio,
+                                       codigof, codigotv, idempaque, fecha_registro, estado)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Activo')""",
+                  (datos["codigoc"], datos["descripcion"], datos["imagen"], datos["imagen_tipo"], datos["peso"],
+                   datos["cantidad"], datos["precio"], datos["codigof"], datos["codigotv"], datos["idempaque"]))
+        return datos["codigoc"]
+
+    @staticmethod
+    def actualizar(codigoc, datos):
+        campos = ["descripcion", "peso", "cantidad", "precio", "codigof", "codigotv", "idempaque"]
+        valores = [datos[c] for c in campos]
+        if datos.get("imagen") is not None:
+            campos += ["imagen", "imagen_tipo"]
+            valores += [datos["imagen"], datos["imagen_tipo"]]
+        asignaciones = ", ".join(f"{c} = %s" for c in campos)
+        return _ejecutar(f"UPDATE lote SET {asignaciones} WHERE codigoc = %s", tuple(valores) + (codigoc,))
+
+    @staticmethod
+    def cambiar_estado(codigoc, estado):
+        return _ejecutar("UPDATE lote SET estado = %s WHERE codigoc = %s", (estado, codigoc))
+
+    @staticmethod
+    def finca_ocupada(codigof):
+        """Lotes de la finca con café disponible, o comprometidos en negocios activos."""
+        fila = _consultar(f"""
+            SELECT
+              (SELECT COUNT(*) FROM lote l WHERE l.codigof = %s AND l.estado = 'Activo'
+                 AND l.cantidad - {SQL_COMPROMETIDA} > 0) AS disponibles,
+              (SELECT COUNT(*) FROM detalle_negocio d INNER JOIN negocio n ON n.idnegocio = d.idnegocio
+                 INNER JOIN lote l2 ON l2.codigoc = d.codigoc
+                 WHERE l2.codigof = %s AND n.estado = 'Activo' AND n.estado_negocio IN {ESTADOS_ACTIVOS}) AS en_negocios
+        """, (codigof, codigof), uno=True)
+        return fila
+
+    @staticmethod
+    def de_productor_disponibles(documento):
+        """Lotes activos con cantidad disponible de un productor (para armar un negocio)."""
+        sql = f"""
+            SELECT l.codigoc, l.descripcion, v.descripcion AS variedad, e.descripcion AS empaque,
+                   l.peso, l.precio, l.cantidad - {SQL_COMPROMETIDA} AS disponible
+            FROM lote l
+            INNER JOIN finca f    ON f.codigof = l.codigof
+            INNER JOIN variedad v ON v.codigotv = l.codigotv
+            INNER JOIN empaque e  ON e.idempaque = l.idempaque
+            WHERE f.documento = %s AND l.estado = 'Activo' AND f.estado = 'Activo'
+            HAVING disponible > 0
+            ORDER BY l.codigoc
+        """
+        return _consultar(sql, (documento,))
+
+
+# ---------------------------------------------------------------------
+# HU-10 · Listado detallado de lotes disponibles
+# ---------------------------------------------------------------------
+class DatosCatalogo:
+    ORDENES = {"precio": "precio_num", "kg": "kg_disponibles", "fecha": "fecha_registro"}
+
+    @staticmethod
+    def listar(texto="", nit_comprador=None, incluir_todos=False, codigotv=None, iddepartamento=None,
+               idmunicipio=None, nit=None, precio_min=None, precio_max=None, orden="fecha", descendente=True):
+        interno = f"""
+            SELECT l.codigoc, l.descripcion, l.codigotv, v.descripcion AS variedad,
+                   e.descripcion AS empaque, l.peso AS peso_num, CAST(l.peso AS CHAR) AS peso,
+                   l.precio AS precio_num, CAST(l.precio AS CHAR) AS precio,
+                   l.cantidad - {SQL_COMPROMETIDA} AS disponible,
+                   (l.cantidad - {SQL_COMPROMETIDA}) * l.peso AS kg_disponibles,
+                   f.codigof, f.nombre AS finca, f.temperatura, m.idmunicipio, m.nombre AS municipio,
+                   d.iddepartamento, d.nombre AS departamento,
+                   pr.documento, CONCAT_WS(' ', per.nom1, per.apell1) AS productor,
+                   (SELECT GROUP_CONCAT(c.nombre ORDER BY c.nombre SEPARATOR ', ')
+                      FROM asociacion a INNER JOIN cooperativa c ON c.nit = a.nit
+                     WHERE a.documento = pr.documento AND a.estado = 'Activo') AS cooperativas,
+                   EXISTS (SELECT 1 FROM asociacion a WHERE a.documento = pr.documento AND a.estado = 'Activo'
+                             AND a.nit = %s) AS asociado,
+                   l.fecha_registro, l.estado, f.estado AS estado_finca, pr.estado AS estado_productor
+            FROM lote l
+            INNER JOIN variedad v     ON v.codigotv = l.codigotv
+            INNER JOIN empaque e      ON e.idempaque = l.idempaque
+            INNER JOIN finca f        ON f.codigof = l.codigof
+            INNER JOIN municipio m    ON m.idmunicipio = f.idmunicipio
+            INNER JOIN departamento d ON d.iddepartamento = m.iddepartamento
+            INNER JOIN productor pr   ON pr.documento = f.documento
+            INNER JOIN persona per    ON per.Idpersona = pr.idpersona
+        """
+        sql = f"SELECT * FROM ({interno}) t WHERE 1 = 1"
+        parametros = [nit_comprador or ""]
+        if not incluir_todos:
+            # Solo lotes Activos, con cantidad disponible, de productores y fincas activos.
+            sql += " AND t.estado = 'Activo' AND t.disponible > 0 AND t.estado_finca = 'Activo' AND t.estado_productor = 'Activo'"
+        if texto:
+            sql += " AND t.descripcion LIKE %s"
+            parametros.append(_filtro_texto(texto))
+        for columna, valor in (("t.codigotv", codigotv), ("t.iddepartamento", iddepartamento),
+                               ("t.idmunicipio", idmunicipio)):
+            if valor is not None:
+                sql += f" AND {columna} = %s"
+                parametros.append(valor)
+        if nit is not None:
+            sql += (" AND EXISTS (SELECT 1 FROM asociacion a WHERE a.documento = t.documento"
+                    " AND a.estado = 'Activo' AND a.nit = %s)")
+            parametros.append(nit)
+        if precio_min is not None:
+            sql += " AND t.precio_num >= %s"
+            parametros.append(precio_min)
+        if precio_max is not None:
+            sql += " AND t.precio_num <= %s"
+            parametros.append(precio_max)
+        sql += f" ORDER BY {DatosCatalogo.ORDENES.get(orden, 'fecha_registro')} {'DESC' if descendente else 'ASC'}"
+        return _consultar(sql, tuple(parametros))
+
+
+# ---------------------------------------------------------------------
+# HU-07 · Negocios con su detalle
+# ---------------------------------------------------------------------
+class DatosNegocio:
+
+    @staticmethod
+    def insertar(cabecera, lineas):
+        """Guarda el negocio y sus líneas en una sola transacción. Devuelve el idnegocio."""
+        conexion = conectar_bd()
+        try:
+            cursor = conexion.cursor()
+            cursor.execute("""INSERT INTO negocio (codigoe, fecha_hora, descripcion, idmedio, valor_total,
+                                                   estado_negocio, documento, nit, idusuario, token, estado)
+                              VALUES (%s, NOW(), %s, %s, %s, 'Propuesto', %s, %s, %s, %s, 'Activo')""",
+                           (cabecera["token"][:20], cabecera["descripcion"], cabecera["idmedio"],
+                            cabecera["valor_total"], cabecera["documento"], cabecera["nit"],
+                            cabecera["idusuario"], cabecera["token"]))
+            idnegocio = cursor.lastrowid
+            cursor.execute("UPDATE negocio SET codigoe = CONCAT('NEG-', LPAD(idnegocio, 4, '0')) WHERE idnegocio = %s",
+                           (idnegocio,))
+            DatosNegocio._insertar_lineas(cursor, idnegocio, lineas)
+            conexion.commit()
+            cursor.close()
+            return idnegocio
+        except Exception:
+            conexion.rollback()
+            raise
+        finally:
+            conexion.close()
+
+    @staticmethod
+    def _insertar_lineas(cursor, idnegocio, lineas):
+        for linea in lineas:
+            cursor.execute("""INSERT INTO detalle_negocio (idnegocio, codigoc, cantidad, peso, precio_kg, subtotal)
+                              VALUES (%s, %s, %s, %s, %s, %s)""",
+                           (idnegocio, linea["codigoc"], linea["cantidad"], linea["peso"],
+                            linea["precio_kg"], linea["subtotal"]))
+
+    @staticmethod
+    def actualizar(idnegocio, cabecera, lineas):
+        """Solo se usa en negocios Propuestos: todavía no tienen entregas, así que el detalle se rehace."""
+        conexion = conectar_bd()
+        try:
+            cursor = conexion.cursor()
+            cursor.execute("""UPDATE negocio SET descripcion = %s, idmedio = %s, valor_total = %s, fecha_hora = NOW()
+                              WHERE idnegocio = %s""",
+                           (cabecera["descripcion"], cabecera["idmedio"], cabecera["valor_total"], idnegocio))
+            cursor.execute("DELETE FROM detalle_negocio WHERE idnegocio = %s", (idnegocio,))
+            DatosNegocio._insertar_lineas(cursor, idnegocio, lineas)
+            conexion.commit()
+            cursor.close()
+        except Exception:
+            conexion.rollback()
+            raise
+        finally:
+            conexion.close()
+
+    SELECT_NEGOCIO = """
+        SELECT n.idnegocio, n.codigoe, CAST(n.fecha_hora AS CHAR) AS fecha_hora, n.descripcion, n.idmedio,
+               mp.descripcion AS medio_pago, CAST(n.valor_total AS CHAR) AS valor_total, n.estado_negocio,
+               n.documento, CONCAT_WS(' ', per.nom1, per.apell1) AS productor, per.movil AS telefono_productor,
+               n.nit, c.nombre AS cooperativa, c.telefono AS telefono_cooperativa, c.estado AS estado_cooperativa,
+               u.nombreu AS comprador, n.motivo_rechazo, CAST(n.fecha_respuesta AS CHAR) AS fecha_respuesta,
+               n.token, n.estado
+        FROM negocio n
+        INNER JOIN medio_pago mp ON mp.idmedio = n.idmedio
+        INNER JOIN productor pr  ON pr.documento = n.documento
+        INNER JOIN persona per   ON per.Idpersona = pr.idpersona
+        INNER JOIN cooperativa c ON c.nit = n.nit
+        INNER JOIN usuario u     ON u.Idusuario = n.idusuario
+    """
+
+    @staticmethod
+    def listar(filtro="", nit=None, documento=None):
+        sql = DatosNegocio.SELECT_NEGOCIO + """
+            WHERE (n.codigoe LIKE %s OR CONCAT_WS(' ', per.nom1, per.apell1) LIKE %s OR c.nombre LIKE %s
+                   OR n.estado_negocio LIKE %s)
+        """
+        parametros = [_filtro_texto(filtro)] * 4
+        if nit is not None:
+            sql += " AND n.nit = %s"
+            parametros.append(nit)
+        if documento is not None:
+            sql += " AND n.documento = %s"
+            parametros.append(documento)
+        sql += " ORDER BY n.idnegocio DESC"
+        return _consultar(sql, tuple(parametros))
+
+    @staticmethod
+    def obtener(idnegocio=None, token=None, codigoe=None):
+        if token is not None:
+            return _consultar(DatosNegocio.SELECT_NEGOCIO + " WHERE n.token = %s", (token,), uno=True)
+        if codigoe is not None:
+            return _consultar(DatosNegocio.SELECT_NEGOCIO + " WHERE n.codigoe = %s", (codigoe,), uno=True)
+        return _consultar(DatosNegocio.SELECT_NEGOCIO + " WHERE n.idnegocio = %s", (idnegocio,), uno=True)
+
+    @staticmethod
+    def detalle(idnegocio):
+        """Líneas del negocio con lo programado, lo recibido y lo pendiente por programar."""
+        sql = """
+            SELECT d.iddetalle, d.codigoc, l.descripcion AS lote, v.descripcion AS variedad,
+                   e.descripcion AS empaque, CAST(d.peso AS CHAR) AS peso, d.cantidad,
+                   CAST(d.precio_kg AS CHAR) AS precio_kg, CAST(d.subtotal AS CHAR) AS subtotal,
+                   COALESCE((SELECT SUM(CASE WHEN en.estado_entrega IN ('Programada', 'En tránsito') THEN en.cantidad
+                                             ELSE en.cantidad_recibida END)
+                               FROM entrega en WHERE en.iddetalle = d.iddetalle AND en.estado = 'Activo'), 0) AS programada,
+                   COALESCE((SELECT SUM(en.cantidad_recibida) FROM entrega en
+                              WHERE en.iddetalle = d.iddetalle AND en.estado = 'Activo'
+                                AND en.estado_entrega IN ('Recibida', 'Recibida con novedad')), 0) AS recibida
+            FROM detalle_negocio d
+            INNER JOIN lote l     ON l.codigoc = d.codigoc
+            INNER JOIN variedad v ON v.codigotv = l.codigotv
+            INNER JOIN empaque e  ON e.idempaque = l.idempaque
+            WHERE d.idnegocio = %s
+            ORDER BY d.iddetalle
+        """
+        filas = _consultar(sql, (idnegocio,))
+        for fila in filas:
+            fila["programada"] = int(fila["programada"])
+            fila["recibida"] = int(fila["recibida"])
+            fila["pendiente"] = fila["cantidad"] - fila["programada"]
+        return filas
+
+    @staticmethod
+    def cambiar_estado(idnegocio, estado_negocio, estado="Activo", motivo=None, respuesta=False):
+        sql = "UPDATE negocio SET estado_negocio = %s, estado = %s"
+        parametros = [estado_negocio, estado]
+        if motivo is not None:
+            sql += ", motivo_rechazo = %s"
+            parametros.append(motivo)
+        if respuesta:
+            sql += ", fecha_respuesta = NOW()"
+        sql += " WHERE idnegocio = %s"
+        parametros.append(idnegocio)
+        return _ejecutar(sql, tuple(parametros))
+
+    @staticmethod
+    def contar(estados, documento=None, nit=None):
+        sql = f"SELECT COUNT(*) AS total FROM negocio WHERE estado = 'Activo' AND estado_negocio IN {estados}"
+        parametros = []
+        if documento is not None:
+            sql += " AND documento = %s"
+            parametros.append(documento)
+        if nit is not None:
+            sql += " AND nit = %s"
+            parametros.append(nit)
+        return _consultar(sql, tuple(parametros), uno=True)["total"]
+
+
+# ---------------------------------------------------------------------
+# HU-08 y HU-09 · Entregas y confirmación de recibido
+# ---------------------------------------------------------------------
+class DatosEntrega:
+    SELECT_ENTREGA = """
+        SELECT en.code, en.iddetalle, CAST(en.fecha AS CHAR) AS fecha, LEFT(CAST(en.hora AS CHAR), 5) AS hora,
+               en.cantidad, en.descripcion, en.lugar, en.estado_entrega, en.estado,
+               en.cantidad_recibida, en.novedad, CAST(en.fecha_confirmacion AS CHAR) AS fecha_confirmacion,
+               uc.nombreu AS confirmado_por, en.aviso_llegada, en.token,
+               d.codigoc, d.cantidad AS cantidad_linea, l.descripcion AS lote,
+               n.idnegocio, n.codigoe, n.estado_negocio, n.estado AS estado_negocio_registro, n.documento, n.nit,
+               CONCAT_WS(' ', per.nom1, per.apell1) AS productor, per.movil AS telefono_productor,
+               c.nombre AS cooperativa, c.telefono AS telefono_cooperativa
+        FROM entrega en
+        INNER JOIN detalle_negocio d ON d.iddetalle = en.iddetalle
+        INNER JOIN lote l            ON l.codigoc = d.codigoc
+        INNER JOIN negocio n         ON n.idnegocio = d.idnegocio
+        INNER JOIN productor pr      ON pr.documento = n.documento
+        INNER JOIN persona per       ON per.Idpersona = pr.idpersona
+        INNER JOIN cooperativa c     ON c.nit = n.nit
+        LEFT JOIN usuario uc         ON uc.Idusuario = en.idusuario_confirma
+    """
+
+    @staticmethod
+    def de_negocio(idnegocio):
+        return _consultar(DatosEntrega.SELECT_ENTREGA + " WHERE n.idnegocio = %s ORDER BY en.fecha, en.hora",
+                          (idnegocio,))
+
+    @staticmethod
+    def obtener(code=None, token=None):
+        if token is not None:
+            return _consultar(DatosEntrega.SELECT_ENTREGA + " WHERE en.token = %s", (token,), uno=True)
+        return _consultar(DatosEntrega.SELECT_ENTREGA + " WHERE en.code = %s", (code,), uno=True)
+
+    @staticmethod
+    def programado_linea(iddetalle, excluir_code=None):
+        """Empaques de la línea en entregas no canceladas (lo recibido cuenta por lo que realmente llegó)."""
+        fila = _consultar("""
+            SELECT COALESCE(SUM(CASE WHEN estado_entrega IN ('Programada', 'En tránsito') THEN cantidad
+                                     ELSE cantidad_recibida END), 0) AS total
+            FROM entrega WHERE iddetalle = %s AND estado = 'Activo' AND code <> %s
+        """, (iddetalle, excluir_code or ""), uno=True)
+        return int(fila["total"])
+
+    @staticmethod
+    def insertar(datos):
+        _ejecutar("""INSERT INTO entrega (code, iddetalle, fecha, hora, cantidad, descripcion, lugar,
+                                          estado_entrega, estado, fecha_registro, token)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, 'Programada', 'Activo', NOW(), %s)""",
+                  (datos["code"], datos["iddetalle"], datos["fecha"], datos["hora"], datos["cantidad"],
+                   datos["descripcion"], datos["lugar"], datos["token"]))
+        return datos["code"]
+
+    @staticmethod
+    def actualizar(code, datos):
+        return _ejecutar("""UPDATE entrega SET iddetalle = %s, fecha = %s, hora = %s, cantidad = %s,
+                                              descripcion = %s, lugar = %s
+                            WHERE code = %s""",
+                         (datos["iddetalle"], datos["fecha"], datos["hora"], datos["cantidad"],
+                          datos["descripcion"], datos["lugar"], code))
+
+    @staticmethod
+    def cambiar_estado(code, estado_entrega, estado="Activo"):
+        return _ejecutar("UPDATE entrega SET estado_entrega = %s, estado = %s WHERE code = %s",
+                         (estado_entrega, estado, code))
+
+    @staticmethod
+    def cancelar_pendientes_de_negocio(idnegocio):
+        return _ejecutar("""UPDATE entrega en INNER JOIN detalle_negocio d ON d.iddetalle = en.iddetalle
+                            SET en.estado_entrega = 'Cancelada', en.estado = 'Anulado'
+                            WHERE d.idnegocio = %s AND en.estado_entrega IN ('Programada', 'En tránsito')""",
+                         (idnegocio,))
+
+    @staticmethod
+    def recibidas_de_negocio(idnegocio):
+        fila = _consultar("""SELECT COUNT(*) AS total FROM entrega en
+                             INNER JOIN detalle_negocio d ON d.iddetalle = en.iddetalle
+                             WHERE d.idnegocio = %s AND en.estado = 'Activo'
+                               AND en.estado_entrega IN ('Recibida', 'Recibida con novedad')""",
+                          (idnegocio,), uno=True)
+        return fila["total"]
+
+    @staticmethod
+    def confirmar(code, cantidad_recibida, novedad, estado_entrega, idusuario):
+        return _ejecutar("""UPDATE entrega SET cantidad_recibida = %s, novedad = %s, estado_entrega = %s,
+                                              fecha_confirmacion = NOW(), idusuario_confirma = %s
+                            WHERE code = %s AND estado_entrega = 'En tránsito'""",
+                         (cantidad_recibida, novedad, estado_entrega, idusuario, code))
+
+    @staticmethod
+    def llegadas_pendientes():
+        """Entregas En tránsito cuya hora programada ya llegó y que aún no tienen aviso al comprador."""
+        return _consultar(DatosEntrega.SELECT_ENTREGA + """
+            WHERE en.estado_entrega = 'En tránsito' AND en.estado = 'Activo' AND en.aviso_llegada IS NULL
+              AND TIMESTAMP(en.fecha, en.hora) <= %s
+        """, (datetime_ahora(),))
+
+    @staticmethod
+    def marcar_aviso(code):
+        return _ejecutar("UPDATE entrega SET aviso_llegada = NOW() WHERE code = %s", (code,))
+
+
+def datetime_ahora():
+    from datetime import datetime
+    return datetime.now().replace(microsecond=0)
+
+
+# ---------------------------------------------------------------------
+# Bitácora de mensajes de WhatsApp
+# ---------------------------------------------------------------------
+class DatosMensaje:
+
+    @staticmethod
+    def insertar(telefono, destinatario, tipo, referencia, texto, medio, resultado, detalle):
+        return _ejecutar("""INSERT INTO mensaje (fecha_hora, telefono, destinatario, tipo, referencia, texto,
+                                                 medio, resultado, detalle)
+                            VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s)""",
+                         (telefono, destinatario, tipo, referencia, texto, medio, resultado, (detalle or "")[:255]))
+
+    @staticmethod
+    def listar(filtro=""):
+        return _consultar("""SELECT idmensaje, CAST(fecha_hora AS CHAR) AS fecha_hora, telefono, destinatario, tipo,
+                                    referencia, texto, medio, resultado, detalle
+                             FROM mensaje
+                             WHERE destinatario LIKE %s OR tipo LIKE %s OR referencia LIKE %s OR texto LIKE %s
+                             ORDER BY idmensaje DESC""", (_filtro_texto(filtro),) * 4)
 

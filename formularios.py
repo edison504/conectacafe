@@ -5,8 +5,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import estilos as e
-from negocio import (ACTIVO, LogicaAsociacion, LogicaCooperativa, LogicaFinca, LogicaPerfil, LogicaPersona,
-                     LogicaProductor, LogicaUbicacion, LogicaUsuario, LogicaVariedad, es_administrador)
+from negocio import (ACTIVO, LogicaAsociacion, LogicaCooperativa, LogicaFinca, LogicaListas, LogicaLote,
+                     LogicaPerfil, LogicaPersona, LogicaProductor, LogicaUbicacion, LogicaUsuario, LogicaVariedad,
+                     es_administrador)
 
 try:  # Pillow permite ver imágenes JPG; sin Pillow solo se ven las PNG.
     from PIL import Image, ImageTk
@@ -126,9 +127,15 @@ class FormularioCRUD(tk.Toplevel):
         self.lbl_modo = tk.Label(caja, text="", font=e.F_PEQUENA, bg=e.BLANCO, fg=e.GRIS)
         self.lbl_modo.grid(row=1, column=0, columnspan=columnas_form * 2, sticky="w", padx=16, pady=(0, 4))
 
-        for n, campo in enumerate(campos):
-            fila = 2 + (n // columnas_form) * 3
-            col = (n % columnas_form) * 2
+        normales = [c for c in campos if not c.get("lateral")]
+        for campo in campos:
+            if campo.get("lateral"):
+                # Campo en una columna aparte, a la derecha de los demás (ej.: la imagen del lote).
+                fila, col = 2, columnas_form * 2
+            else:
+                n = normales.index(campo)
+                fila = 2 + (n // columnas_form) * 3
+                col = (n % columnas_form) * 2
             texto = campo["etiqueta"] + (" *" if campo.get("obligatorio") else "")
             tk.Label(caja, text=texto, font=e.F_NEGRITA, bg=e.BLANCO, fg=e.TEXTO).grid(
                 row=fila, column=col, sticky="w", padx=16, pady=(6, 0))
@@ -140,17 +147,23 @@ class FormularioCRUD(tk.Toplevel):
             else:
                 w = tk.Entry(caja, width=ancho_campo, font=e.F_NORMAL, relief="solid", bd=1,
                              show="•" if campo["tipo"] == "clave" else "")
-            w.grid(row=fila + 1, column=col, sticky="we", padx=16, ipady=3)
+            if campo.get("lateral"):
+                w.grid(row=fila + 1, column=col, rowspan=8, sticky="nw", padx=16, ipady=3)
+            else:
+                w.grid(row=fila + 1, column=col, sticky="we", padx=16, ipady=3)
             if campo["tipo"] == "clave":
                 self.var_ver = tk.BooleanVar()
                 tk.Checkbutton(caja, text="Ver", variable=self.var_ver, bg=e.BLANCO, font=e.F_PEQUENA,
                                command=lambda w=w: w.config(show="" if self.var_ver.get() else "•")
                                ).grid(row=fila + 1, column=col + 1, padx=(0, 10))
-            if campo.get("ayuda"):
+            if campo.get("ayuda") and campo.get("lateral"):
+                w.ayuda = tk.Label(w, text=campo["ayuda"], font=(e.FUENTE, 8), bg=e.BLANCO, fg=e.GRIS)
+                w.ayuda.pack(anchor="w")
+            elif campo.get("ayuda"):
                 tk.Label(caja, text=campo["ayuda"], font=(e.FUENTE, 8), bg=e.BLANCO, fg=e.GRIS).grid(
                     row=fila + 2, column=col, sticky="w", padx=16)
             self.widgets[campo["clave"]] = w
-        ultima = 2 + ((len(campos) - 1) // columnas_form + 1) * 3
+        ultima = 2 + ((len(normales) - 1) // columnas_form + 1) * 3
         tk.Label(caja, text="* Campos obligatorios", font=(e.FUENTE, 8, "italic"), bg=e.BLANCO,
                  fg=e.GRIS).grid(row=ultima, column=0, sticky="w", padx=16, pady=(8, 12))
 
@@ -219,9 +232,12 @@ class FormularioCRUD(tk.Toplevel):
         marco = tk.Frame(caja, bg=e.BLANCO)
         vista = tk.Label(marco, text="Sin imagen", width=24, height=6, bg=e.CREMA, fg=e.GRIS,
                          font=e.F_PEQUENA, relief="solid", bd=1)
-        vista.pack(side="left")
+        vista.pack(side="top" if campo.get("lateral") else "left", anchor="w")
         lado = tk.Frame(marco, bg=e.BLANCO)
-        lado.pack(side="left", padx=10, anchor="n")
+        if campo.get("lateral"):
+            lado.pack(side="top", anchor="w", pady=(8, 0))
+        else:
+            lado.pack(side="left", padx=10, anchor="n")
         boton = e.boton(lado, "Elegir imagen…", lambda: self._elegir_imagen(campo["clave"]), e.CAFE_CLARO,
                         fuente=e.F_PEQUENA)
         boton.pack(anchor="w")
@@ -790,7 +806,8 @@ def abrir_finca(master, sesion, permitidas, al_cerrar=None):
     ]
     columnas = [("codigof", "Código", 70), ("nombre", "Finca", 150), ("productor", "Productor", 150),
                 ("municipio", "Municipio", 130), ("departamento", "Departamento", 130),
-                ("area", "Área (ha)", 75), ("temperatura", "Temp. (°C)", 75), ("estado", "Estado", 70)]
+                ("area", "Área (ha)", 70), ("temperatura", "Temp. (°C)", 70), ("lotes", "Lotes", 50),
+                ("estado", "Estado", 70)]
     filtros = []
     if admin:
         # El administrador consulta todas las fincas y las filtra por departamento, municipio y productor.
@@ -924,3 +941,41 @@ def abrir_variedad(master, sesion, permitidas, al_cerrar=None):
                    else "Variedades activas, en orden alfabético")
     return FormularioCRUD(master, LogicaVariedad, "Variedades", descripcion, campos, columnas, sesion,
                           permitidas, icono="❦", al_cerrar=al_cerrar)
+
+
+# =====================================================================
+# FINAL
+# =====================================================================
+# ---------------------------------------------------------------------
+# HU-06 · Gestión de Inventario y Catálogo de Café (lotes)
+# ---------------------------------------------------------------------
+def abrir_lote(master, sesion, permitidas, al_cerrar=None):
+    admin = es_administrador(sesion)
+    campos = [
+        {"clave": "codigoc", "etiqueta": "Código del lote", "tipo": "texto", "obligatorio": True, "llave": True,
+         "ayuda": "Ej.: L-001 · no se modifica"},
+        {"clave": "descripcion", "etiqueta": "Descripción (tipo y calidad)", "tipo": "texto", "obligatorio": True,
+         "ayuda": "Ej.: pergamino seco, factor 92, cosecha 2026"},
+        {"clave": "codigof", "etiqueta": "Finca", "tipo": "combo", "obligatorio": True,
+         "opciones": lambda codigo: LogicaLote.opciones_finca(sesion, codigo),
+         "ayuda": "Solo sus fincas activas"},
+        {"clave": "codigotv", "etiqueta": "Variedad", "tipo": "combo", "obligatorio": True,
+         "opciones": LogicaLote.opciones_variedad, "ayuda": "Variedades activas (HU-05)"},
+        {"clave": "idempaque", "etiqueta": "Tipo de empaque", "tipo": "combo", "obligatorio": True,
+         "opciones": lambda _id: LogicaListas.empaques()},
+        {"clave": "peso", "etiqueta": "Peso por empaque (kg)", "tipo": "texto", "obligatorio": True,
+         "ayuda": "Mayor que cero (ej.: 70)"},
+        {"clave": "cantidad", "etiqueta": "Cantidad de empaques", "tipo": "texto", "obligatorio": True,
+         "ayuda": "Número entero mayor que cero"},
+        {"clave": "precio", "etiqueta": "Precio de compra por kg ($)", "tipo": "texto", "obligatorio": True,
+         "ayuda": "Mayor que cero · solo aplica a negocios nuevos"},
+        {"clave": "imagen", "etiqueta": "Imagen del café", "tipo": "imagen", "obligatorio": True,
+         "cargar": LogicaLote.imagen, "ayuda": "JPG o PNG, máximo 2 MB", "lateral": True},
+    ]
+    columnas = [("codigoc", "Código", 70), ("descripcion", "Descripción", 210), ("finca", "Finca", 120),
+                ("variedad", "Variedad", 85), ("empaque", "Empaque", 150), ("peso", "Peso (kg)", 70),
+                ("cantidad", "Cantidad", 65), ("comprometida", "Comprometida", 90),
+                ("disponible", "Disponible", 75), ("precio", "Precio/kg", 80), ("estado", "Estado", 65)]
+    descripcion = "Todos los lotes de café" if admin else "Mi inventario: mis lotes de café"
+    return FormularioCRUD(master, LogicaLote, "Lotes de café", descripcion, campos, columnas, sesion, permitidas,
+                          icono="▦", al_cerrar=al_cerrar, columnas_form=3)
